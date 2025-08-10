@@ -105,25 +105,21 @@ def search_answer():
             print("⚠ OpenAI quota exceeded, switching to Gemini...")
 
     # Use Gemini if OpenAI fails or quota exceeded
-    if GEMINI_API_KEY:
-        try:
-            # Gemini accepts plain text prompt; combine system + conversation
-            conversation_text = system_prompt + "\nConversation:\n"
-            for msg in messages:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                conversation_text += f"{role}: {msg['content']}\n"
-            conversation_text += "Assistant:"
+  if GEMINI_API_KEY:
+    try:
+        conversation_text = system_prompt + "\nConversation:\n"
+        for msg in messages:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            conversation_text += f"{role}: {msg['content']}\n"
+        conversation_text += "Assistant:"
 
-            model = genai.get_model("gemini-2.5-flash-lite")  # your Gemini model here
-            resp = model.generate_content(
-                prompt=conversation_text,
-                temperature=0.3,
-                max_output_tokens=300,
-            )
-            answer = resp.text
-            return jsonify({"answer": answer, "sources": results})
-        except Exception as e:
-            return jsonify({"answer": f"Gemini error: {e}", "sources": []})
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_text(conversation_text)  # <- fix here
+        answer = resp.text
+        return jsonify({"answer": answer, "sources": results})
+    except Exception as e:
+        return jsonify({"answer": f"Gemini error: {e}", "sources": []})
+
 
     # Fallback to offline FAQ
     for key, answer in MEDICAL_FAQ.items():
