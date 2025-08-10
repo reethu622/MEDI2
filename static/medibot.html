@@ -153,11 +153,11 @@
     chatBox.scrollTop = chatBox.scrollHeight;
   }
 
-  function typeMessage(text, sources = [], speed = 20) {
+  function displayMessage(text, sources = []) {
     const msgDiv = document.createElement("div");
     msgDiv.classList.add("message", "bot");
 
-    let html = `<span class="bot-label">Medibot:</span> <span id="typing-text"></span>`;
+    let html = `<span class="bot-label">Medibot:</span> ${text}`;
     if (sources.length > 0) {
       html += `<br/><strong>Sources:</strong><ul class="sources-list">`;
       sources.forEach((src, idx) => {
@@ -168,20 +168,6 @@
     msgDiv.innerHTML = html;
     chatBox.appendChild(msgDiv);
     chatBox.scrollTop = chatBox.scrollHeight;
-
-    const typingSpan = msgDiv.querySelector("#typing-text");
-    let i = 0;
-    function typeNextChar() {
-      if (i < text.length) {
-        typingSpan.textContent += text.charAt(i);
-        i++;
-        chatBox.scrollTop = chatBox.scrollHeight;
-        setTimeout(typeNextChar, speed);
-      } else {
-        loadingDiv.style.display = "none";
-      }
-    }
-    typeNextChar();
   }
 
   async function sendQuestion() {
@@ -202,12 +188,13 @@
       });
       const data = await response.json();
       messages.push({ role: "assistant", content: data.answer });
-      typeMessage(data.answer || "Sorry, I couldn't find an answer.", data.sources || []);
+      displayMessage(data.answer || "Sorry, I couldn't find an answer.", data.sources || []);
     } catch (err) {
       loadingDiv.style.display = "none";
       appendMessage("Error: Unable to get response.", "bot");
       console.error(err);
     } finally {
+      loadingDiv.style.display = "none";
       sendBtn.disabled = false;
       userInput.focus();
     }
@@ -222,6 +209,7 @@
 </script>
 </body>
 </html>
+
 
 
 
