@@ -1,121 +1,99 @@
 import os
-import re
-import requests
 from flask import Flask, request, jsonify, send_from_directory
-from google import genai
+from better_profanity import profanity
+from flask_cors import CORS
+import requests
+import google.generativeai as genai
 
 app = Flask(__name__)
+CORS(app)
 
-# Initialize Google GenAI client
-client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
+# Load profanity filter words
+profanity.load_censor_words()
 
-# Google Custom Search API config - set these environment variables
-GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX")
+# Configure Google Generative AI (Gemini)
+GENAI_API_KEY = os.getenv("GOOGLE_GENAI_API_KEY") or "YOUR_GENAI_API_KEY"
+genai.configure(api_key=GENAI_API_KEY)
 
-GREETING_KEYWORDS = ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"]
-ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "damn"]  # expand as needed
-
-def is_greeting(text):
-    text = text.lower()
-    return any(greet in text for greet in GREETING_KEYWORDS)
-
-def is_abusive(text):
-    text = text.lower()
-    return any(word in text for word in ABUSIVE_WORDS)
-
-def resolve_reference(messages):
-    last_msg = messages[-1]["content"].lower()
-    if any(phrase in last_msg for phrase in ["types of it", "type of it", "elaborate on it"]):
-        # Find last medical topic (naive approach: last user message before this one)
-        for msg in reversed(messages[:-1]):
-            if msg["role"] == "user":
-                return msg["content"]
-    return None
+# Google Custom Search API setup
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or "YOUR_GOOGLE_API_KEY"
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID") or "YOUR_CUSTOM_SEARCH_ENGINE_ID"
 
 def google_search(query, num_results=3):
-    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX:
-        return []
-
+    """Perform Google Custom Search and return title/link list"""
     search_url = "https://www.googleapis.com/customsearch/v1"
     params = {
-        "key": GOOGLE_SEARCH_API_KEY,
-        "cx": GOOGLE_SEARCH_CX,
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
         "q": query,
         "num": num_results,
     }
+    resp = requests.get(search_url, params=params)
+    results = []
+    if resp.status_code == 200:
+        data = resp.json()
+        items = data.get("items", [])
+        for item in items:
+            results.append({"title": item.get("title"), "link": item.get("link")})
+    return results
 
+def generate_gemini_response(prompt):
+    """Use Google Gemini (Generative AI) to generate a response."""
     try:
-        resp = requests.get(search_url, params=params)
-        resp.raise_for_status()
-        results = resp.json().get("items", [])
-        sources = []
-        for item in results:
-            title = item.get("title")
-            link = item.get("link")
-            if title and link:
-                sources.append({"title": title, "link": link})
-        return sources
-    except Exception as e:
-        print("Google Search API error:", e)
-        return []
-
-@app.route("/api/v1/search_answer", methods=["POST"])
-def search_answer():
-    data = request.get_json()
-    messages = data.get("messages", [])
-
-    if not messages:
-        return jsonify({"answer": "Please say something!", "sources": []})
-
-    user_message = messages[-1]["content"].strip()
-
-    if is_abusive(user_message):
-        return jsonify({
-            "answer": "I’m here to help you respectfully. Please avoid using abusive language.",
-            "sources": []
-        })
-
-    if is_greeting(user_message):
-        return jsonify({
-            "answer": "Hi again! 👋 How can I help you today?",
-            "sources": []
-        })
-
-    referenced_topic = resolve_reference(messages)
-    prompt_text = user_message
-    if referenced_topic:
-        prompt_text = f"{user_message}. Context: {referenced_topic}"
-
-    # Call GenAI for answer
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt_text,
+        model = genai.get_model("gemini-2.5-turbo")  # adjust model name as needed
+        response = model.generate_content(
+            model="gemini-2.5-turbo",
+            contents=prompt,
+            temperature=0.7,
+            max_output_tokens=300,
         )
-        answer_text = getattr(response, "text", None) or "Sorry, I couldn't find an answer."
+        return response.text if hasattr(response, "text") else str(response)
     except Exception as e:
-        print("GenAI error:", e)
-        answer_text = "Sorry, I encountered an error while trying to answer."
-
-    # Use Google Custom Search for sources
-    sources = google_search(prompt_text)
-
-    return jsonify({
-        "answer": answer_text,
-        "sources": sources,
-    })
+        print("Gemini API error:", e)
+        return "Sorry, I am having trouble generating a response right now."
 
 @app.route("/")
 def index():
     return send_from_directory("static", "medibot.html")
 
+@app.route("/api/v1/search_answer", methods=["POST"])
+def search_answer():
+    data = request.get_json()
+    messages = data.get("messages", [])
+    user_message = messages[-1]["content"] if messages else ""
+
+    # Profanity filter
+    if profanity.contains_profanity(user_message):
+        return jsonify({
+            "answer": "Please avoid using inappropriate language. How can I assist you politely?",
+            "sources": []
+        })
+
+    # Greeting detection
+    greetings = ["hi", "hello", "hey", "hola", "howdy"]
+    if any(user_message.lower().startswith(greet) for greet in greetings):
+        return jsonify({
+            "answer": "Hi! 👋 How can I help you today?",
+            "sources": []
+        })
+
+    # Keywords to choose Gemini AI for explanations
+    ai_keywords = ["type", "explain", "definition", "meaning", "what is", "how does", "describe", "tell me about"]
+    if any(kw in user_message.lower() for kw in ai_keywords):
+        answer = generate_gemini_response(user_message)
+        return jsonify({
+            "answer": answer,
+            "sources": []
+        })
+
+    # Otherwise, fallback to Google Search results
+    sources = google_search(user_message)
+    answer = "Here are some results I found related to your question."
+    return jsonify({
+        "answer": answer,
+        "sources": sources
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
