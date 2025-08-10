@@ -10,8 +10,8 @@ CORS(app)
 
 # Load API keys from environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_SEARCH_CX")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY environment variable not set")
