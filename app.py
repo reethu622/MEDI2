@@ -20,6 +20,7 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
+# Basic offline medical FAQ fallback
 MEDICAL_FAQ = {
     "fever symptoms": "Common symptoms include high temperature, sweating, chills, headache, and muscle aches.",
     "cold symptoms": "Sneezing, runny or stuffy nose, sore throat, coughing, mild headache, and fatigue.",
@@ -27,8 +28,10 @@ MEDICAL_FAQ = {
 }
 
 def google_search_with_citations(query):
+    """Perform Google Custom Search and return results with formatted citations."""
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
-        return [], ""
+        return [], ""  # Skip search if keys missing
+
     params = {
         "key": GOOGLE_SEARCH_KEY,
         "cx": GOOGLE_SEARCH_CX,
@@ -61,6 +64,7 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
+    # Find latest user message to query info on
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -73,13 +77,7 @@ def search_answer():
     # Run Google Search on latest user question
     results, formatted_results = google_search_with_citations(latest_user_message)
 
-    # If no Google results, fallback to offline FAQ before AI call
-    if not results:
-        for key, answer in MEDICAL_FAQ.items():
-            if key in latest_user_message.lower():
-                return jsonify({"answer": answer, "sources": []})
-        return jsonify({"answer": "Sorry, I couldn't find reliable sources for that question. Please try rephrasing or consult a healthcare professional.", "sources": []})
-
+    # System prompt to guide the assistant
     system_prompt = (
         "You are a helpful and knowledgeable medical assistant. "
         "Answer the user's questions based on the following web search results. "
@@ -87,10 +85,11 @@ def search_answer():
         f"{formatted_results}\n"
     )
 
+    # Prepare messages for OpenAI
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
 
-    # Try OpenAI GPT-3.5 Turbo if key present
+    # Use OpenAI if available
     if OPENAI_API_KEY:
         try:
             resp = openai.ChatCompletion.create(
@@ -103,27 +102,33 @@ def search_answer():
         except Exception as e:
             if "quota" not in str(e).lower():
                 return jsonify({"answer": f"OpenAI error: {e}", "sources": []})
-            print("⚠ OpenAI quota exceeded or error, switching to Gemini...")
+            print("⚠ OpenAI quota exceeded, switching to Gemini...")
 
-    # Gemini fallback
+    # Use Gemini if OpenAI fails or quota exceeded
     if GEMINI_API_KEY:
         try:
+            # Gemini accepts plain text prompt; combine system + conversation
             conversation_text = system_prompt + "\nConversation:\n"
             for msg in messages:
                 role = "User" if msg["role"] == "user" else "Assistant"
                 conversation_text += f"{role}: {msg['content']}\n"
             conversation_text += "Assistant:"
 
-            model = genai.get_model("gemini-2.5-flash-lite")  # use your correct model here
-            resp = model.generate_text(
+            model = genai.get_model("gemini-2.5-flash-lite")  # your Gemini model here
+            resp = model.generate_content(
                 prompt=conversation_text,
                 temperature=0.3,
                 max_output_tokens=300,
             )
-            answer = resp.result
+            answer = resp.text
             return jsonify({"answer": answer, "sources": results})
         except Exception as e:
             return jsonify({"answer": f"Gemini error: {e}", "sources": []})
+
+    # Fallback to offline FAQ
+    for key, answer in MEDICAL_FAQ.items():
+        if key in latest_user_message.lower():
+            return jsonify({"answer": answer, "sources": []})
 
     return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
 
@@ -134,9 +139,3 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
