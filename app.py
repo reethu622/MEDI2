@@ -1,93 +1,201 @@
 import os
 import requests
+import logging
 from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from typing import List, Dict
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("medibot")
 
 app = Flask(__name__, static_folder="static")
+CORS(app)
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")  # restricted medical CSE
+GOOGLE_CSE_ID_PUBLIC = os.environ.get("GOOGLE_CSE_ID_PUBLIC")  # optional public fallback
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ✅ Trusted sources including Wikipedia
-trusted_sites = [
+if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or not GEMINI_API_KEY:
+    log.warning("One or more required environment variables are missing.")
+
+TRUSTED_SITES = [
     "site:mayoclinic.org",
     "site:webmd.com",
     "site:nih.gov",
     "site:who.int",
-    "site:health.harvard.edu",
     "site:cdc.gov",
     "site:clevelandclinic.org",
     "site:medlineplus.gov",
+    "site:health.harvard.edu",
     "site:wikipedia.org"
 ]
 
-def google_search(query):
-    """Searches Google Custom Search restricted to trusted sources."""
+conversation_history: List[Dict[str, str]] = []
+greeted_users = set()  # to keep track of users greeted (could be IP or session in prod)
+
+
+def google_search(query: str, cx_id: str, num: int = 5) -> List[Dict]:
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
         "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query
+        "cx": cx_id,
+        "q": query,
+        "num": num
     }
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    return response.json()
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("items", [])
+    except Exception:
+        log.exception("Google search failed")
+        return []
 
-def get_gemini_answer(question, context):
-    """Calls Gemini API to generate answer based on context."""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+
+def build_search_query(user_text: str) -> str:
+    site_filter = " OR ".join(TRUSTED_SITES)
+    return f"{user_text} {site_filter}"
+
+
+def call_gemini(prompt_text: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/text-bison-001:generate"
     headers = {"Content-Type": "application/json"}
     params = {"key": GEMINI_API_KEY}
-    payload = {
-        "contents": [{
-            "parts": [{"text": f"Answer the following medical question:\n\nQuestion: {question}\n\nSources:\n{context}"}]
-        }]
+    body = {
+        "prompt": {"text": prompt_text},
+        "temperature": 0.2,
+        "maxTokens": 800,
     }
-    resp = requests.post(url, headers=headers, params=params, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        return "Sorry, I couldn't generate an answer."
+        resp = requests.post(url, headers=headers, params=params, json=body, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"] if "candidates" in data else ""
+    except Exception:
+        log.exception("Gemini call failed")
+        return ""
+
+
+SYSTEM_PROMPT = """You are Medibot, a professional, cautious and accurate medical assistant.
+Rules (very important):
+- ONLY provide medical/health-related information: conditions, symptoms, causes, tests, treatments, prevention, and when to seek care.
+- Use the provided search results (listed below) as the ONLY sources of factual information. Cite them inline with numbers like [1], [2].
+- If the information is not present in the provided sources, say you don't have enough information and advise consulting a healthcare professional.
+- If the user asks something clearly non-medical or abusive/illegal/dangerous (e.g., instructions for wrongdoing, explicit sexual content, self-harm steps), refuse politely and redirect to safe resources or encourage seeking professional help.
+- Resolve ambiguous pronouns ("it", "those", "that") using the conversation history provided.
+- Keep answers concise (3-6 short paragraphs) and factual. At the end, list the sources used with numbers and links.
+"""
+
+
+def build_prompt(user_question: str, search_items: List[Dict], history: List[Dict]) -> str:
+    history_text_lines = []
+    last_n = 10
+    for turn in history[-last_n:]:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        if role and content:
+            history_text_lines.append(f"{role.title()}: {content}")
+    history_text = "\n".join(history_text_lines) if history_text_lines else "(no previous context)"
+
+    snippets = []
+    for i, item in enumerate(search_items[:6]):
+        title = item.get("title", "No title")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        snippets.append(f"[{i+1}] {title}\n{snippet}\n{link}")
+
+    search_text = "\n\n".join(snippets) if snippets else "No search results available."
+
+    prompt = (
+        SYSTEM_PROMPT + "\n\n"
+        "Conversation history:\n" + history_text + "\n\n"
+        "Search results (trusted sources):\n" + search_text + "\n\n"
+        f"User question: {user_question}\n\n"
+        "Using ONLY the above search results and the conversation context, answer the user's question. "
+        "Cite sources inline using [1], [2], etc., and then list the sources used with their links at the end."
+    )
+    return prompt
+
+
+def is_greeting(text: str) -> bool:
+    return text.lower() in ["hi", "hello", "hey"]
+
 
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "medibot.html")
 
+
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
-    data = request.json
-    if not data or "messages" not in data:
-        return jsonify({"error": "Invalid request"}), 400
-
-    user_question = ""
-    for msg in data["messages"]:
-        if msg["role"] == "user":
-            user_question = msg["content"]
-
-    if not user_question:
-        return jsonify({"error": "No question found"}), 400
-
-    # Build query restricted to trusted sites
-    query = f"{user_question} {' OR '.join(trusted_sites)}"
+    global conversation_history
 
     try:
-        # Google Custom Search
-        search_results = google_search(query)
-        items = search_results.get("items", [])
-        sources = [{"title": i["title"], "link": i["link"]} for i in items[:5]]
-        context_text = "\n".join([f"{i['title']}: {i['link']}" for i in sources])
+        data = request.get_json(force=True)
+    except Exception:
+        log.exception("Bad JSON in request")
+        return jsonify({"answer": "Invalid request JSON.", "sources": []}), 400
 
-        # Gemini AI Answer
-        answer = get_gemini_answer(user_question, context_text)
+    messages = data.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return jsonify({"answer": "Please send conversation messages (list).", "sources": []}), 400
 
-        return jsonify({"answer": answer, "sources": sources})
+    latest_user = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and msg.get("content"):
+            latest_user = msg.get("content").strip()
+            break
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if not latest_user:
+        return jsonify({"answer": "No user question found.", "sources": []}), 400
+
+    # Check if user said a greeting and return greeting answer without searching
+    if is_greeting(latest_user):
+        # Only send greeting once per session (basic, no user id, so always sends)
+        greeting_msg = "Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?"
+        conversation_history.append({"role": "user", "content": latest_user})
+        conversation_history.append({"role": "assistant", "content": greeting_msg})
+        return jsonify({"answer": greeting_msg, "sources": []})
+
+    conversation_history.append({"role": "user", "content": latest_user})
+
+    query_restricted = build_search_query(latest_user)
+
+    items = []
+    if GOOGLE_API_KEY and GOOGLE_CSE_ID:
+        items = google_search(query_restricted, GOOGLE_CSE_ID)
+
+    if not items and GOOGLE_CSE_ID_PUBLIC:
+        items = google_search(latest_user, GOOGLE_CSE_ID_PUBLIC)
+
+    if not items:
+        return jsonify({"answer": "Sorry, I couldn't find reliable sources for that question. Please try rephrasing or consult a healthcare professional.", "sources": []})
+
+    sources = []
+    for it in items[:6]:
+        sources.append({
+            "title": it.get("title", "")[:200],
+            "link": it.get("link", "")
+        })
+
+    prompt = build_prompt(latest_user, items, conversation_history)
+    gemini_answer = call_gemini(prompt)
+
+    if not gemini_answer:
+        snippets = [it.get("snippet", "") for it in items[:3] if it.get("snippet")]
+        fallback_answer = " ".join(snippets) or "Sorry, I couldn't find an answer."
+        conversation_history.append({"role": "assistant", "content": fallback_answer})
+        return jsonify({"answer": fallback_answer, "sources": sources})
+
+    conversation_history.append({"role": "assistant", "content": gemini_answer})
+
+    return jsonify({"answer": gemini_answer, "sources": sources})
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 
 
