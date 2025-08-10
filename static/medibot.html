@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Medibot</title>
 <style>
+  /* Your existing CSS here — keep it the same */
   body {
     font-family: Arial, sans-serif;
     max-width: 700px;
@@ -119,8 +120,9 @@
 </head>
 <body>
   <h1>Medibot 🤖</h1>
-  <div class="chat-box" id="chat-box"></div>
-
+  <div class="chat-box" id="chat-box">
+    <div class="message bot"><span class="bot-label">Medibot:</span> Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?</div>
+  </div>
   <form id="chat-form" class="input-area" autocomplete="off">
     <input type="text" id="user-input" placeholder="Ask a medical question..." />
     <button type="submit" title="Send">
@@ -133,19 +135,18 @@
   const chatForm = document.getElementById("chat-form");
   const userInput = document.getElementById("user-input");
 
-  // Maintain full conversation history here
+  // Initialize messages with system greeting (system prompt is in backend, here for UI context)
   const messages = [
-    { role: "assistant", content: "Hello! 👋 I'm Medibot. I am Your Medi Assistant." }
+    { role: "system", content: "You are Medibot, a helpful medical assistant." },
+    { role: "assistant", content: "Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?" }
   ];
-
-  // Display initial greeting message
-  appendMessage(messages[0].content, "bot");
 
   function appendMessage(content, sender, sources = []) {
     const msgDiv = document.createElement("div");
     msgDiv.classList.add("message", sender);
     if (sender === "user") {
       msgDiv.innerHTML = `<span class="user-label">You:</span> ${content}`;
+      messages.push({ role: "user", content });
     } else {
       let html = `<span class="bot-label">Medibot:</span> ${content}`;
       if (sources.length > 0) {
@@ -156,13 +157,16 @@
         html += "</ul>";
       }
       msgDiv.innerHTML = html;
+      messages.push({ role: "assistant", content });
     }
     chatBox.appendChild(msgDiv);
     chatBox.scrollTop = chatBox.scrollHeight;
   }
 
-  async function sendQuestion(question) {
-    messages.push({ role: "user", content: question });
+  async function sendQuestion() {
+    const question = userInput.value.trim();
+    if (!question) return;
+
     appendMessage(question, "user");
     userInput.value = "";
     userInput.disabled = true;
@@ -174,10 +178,7 @@
         body: JSON.stringify({ messages }),
       });
       const data = await response.json();
-
-      const botReply = data.answer || "Sorry, I couldn't find an answer.";
-      messages.push({ role: "assistant", content: botReply });
-      appendMessage(botReply, "bot", data.sources || []);
+      appendMessage(data.answer || "Sorry, I couldn't find an answer.", "bot", data.sources || []);
     } catch (err) {
       appendMessage("Error: Unable to get response.", "bot");
       console.error(err);
@@ -189,13 +190,11 @@
 
   chatForm.addEventListener("submit", (e) => {
     e.preventDefault();
-    const question = userInput.value.trim();
-    if (question) {
-      sendQuestion(question);
-    }
+    sendQuestion();
   });
 
   userInput.focus();
 </script>
 </body>
 </html>
+
