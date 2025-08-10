@@ -1,32 +1,41 @@
 import os
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 import requests
-import google.generativeai as genai
-
-# Load environment variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX")
-
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
+CORS(app)
 
-# Search function using Google Custom Search API
-def google_search(query, num_results=5):
+# Load API keys from Railway variables
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Expanded list of reliable medical sources
+SEARCH_SITES = (
+    "site:mayoclinic.org OR site:webmd.com OR site:nih.gov OR "
+    "site:who.int OR site:cdc.gov OR site:clevelandclinic.org OR site:medlineplus.gov"
+)
+
+# Keep conversation context in memory
+conversation_history = []
+
+
+def google_search(query):
+    """Perform a Google Custom Search limited to our trusted medical sites."""
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
-        "key": GOOGLE_SEARCH_KEY,
-        "cx": GOOGLE_SEARCH_CX,
-        "q": query
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": f"{query} {SEARCH_SITES}",
+        "num": 5
     }
-    res = requests.get(url, params=params)
-    res.raise_for_status()
-    data = res.json()
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
     results = []
     if "items" in data:
-        for item in data["items"][:num_results]:
+        for item in data["items"]:
             results.append({
                 "title": item.get("title"),
                 "link": item.get("link"),
@@ -34,68 +43,73 @@ def google_search(query, num_results=5):
             })
     return results
 
-# Get trusted medical answer from Gemini
-def get_medical_answer(question, chat_history):
-    trusted_sites = [
-        "site:mayoclinic.org",
-        "site:webmd.com",
-        "site:nih.gov",
-        "site:who.int",
-        "site:cdc.gov",
-        "site:clevelandclinic.org"
-    ]
-    search_query = f"{question} {' OR '.join(trusted_sites)}"
 
-    search_results = google_search(search_query, num_results=5)
+def generate_answer(prompt):
+    """Generate answer using Gemini API."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    resp = requests.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        return "Sorry, I couldn't process the answer."
 
-    # Prepare context for Gemini
-    sources_text = "\n".join(
-        [f"[{i+1}] {r['title']} - {r['snippet']}" for i, r in enumerate(search_results)]
-    )
-
-    prompt = f"""
-You are Medibot, a helpful and polite medical assistant.
-If user uses abusive language, politely warn them.
-Always keep conversation context from earlier messages.
-When user refers to 'it' or 'those', resolve from previous history.
-
-Question: {question}
-
-Relevant medical info from trusted sources:
-{sources_text}
-
-Instructions:
-1. Answer in clear, plain language.
-2. Base your answer on the trusted sources above.
-3. Cite sources as [1], [2], etc. at the end of relevant sentences.
-4. If unsure, say so and recommend consulting a doctor.
-"""
-
-    # Include chat history for context
-    messages = [{"role": m["role"], "parts": [m["content"]]} for m in chat_history]
-    messages.append({"role": "user", "parts": [prompt]})
-
-    model = genai.GenerativeModel("gemini-pro")
-    response = model.generate_content(messages)
-
-    return response.text.strip(), search_results
 
 @app.route("/")
 def index():
-    return render_template("medibot.html")
+    # Serve HTML file from static folder
+    return send_from_directory("static", "medibot.html")
+
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
-    data = request.json
+    global conversation_history
+    data = request.get_json()
     messages = data.get("messages", [])
-    if not messages:
-        return jsonify({"answer": "No question provided.", "sources": []})
 
-    # Last user message
-    question = messages[-1]["content"]
-    answer, sources = get_medical_answer(question, messages[:-1])
-    return jsonify({"answer": answer, "sources": sources})
+    if not messages:
+        return jsonify({"answer": "No question received.", "sources": []})
+
+    # Extract the latest user question
+    latest_message = messages[-1]["content"]
+
+    # Handle pronouns like "it" or "that"
+    if latest_message.lower() in ["it", "that", "they", "those"] or latest_message.lower().startswith(("what are the types", "tell me more")):
+        # Find the last medical topic mentioned in the conversation
+        for msg in reversed(conversation_history):
+            if msg["role"] == "user" and not any(word in msg["content"].lower() for word in ["it", "that", "they", "those"]):
+                latest_message = latest_message.replace("it", msg["content"])
+                break
+
+    # Add latest user question to conversation history
+    conversation_history.append({"role": "user", "content": latest_message})
+
+    # Search Google Custom Search for reliable info
+    search_results = google_search(latest_message)
+
+    # Prepare search summary for Gemini
+    search_text = "\n".join([f"{item['title']} - {item['snippet']}" for item in search_results])
+
+    # Ask Gemini to answer based on the search results
+    prompt = (
+        f"You are Medibot, a helpful medical assistant.\n\n"
+        f"User asked: {latest_message}\n\n"
+        f"Here are some relevant sources:\n{search_text}\n\n"
+        "Please give a concise, factual, and easy-to-understand answer for the user."
+    )
+    answer = generate_answer(prompt)
+
+    # Add bot answer to conversation history
+    conversation_history.append({"role": "assistant", "content": answer})
+
+    return jsonify({"answer": answer, "sources": search_results})
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
