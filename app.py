@@ -2,7 +2,7 @@ import os
 import re
 import requests
 import google.generativeai as genai
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # Load API keys from environment variables
@@ -13,34 +13,33 @@ GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-app = Flask(__name__, static_folder="static")
+app = Flask(__name__)
 CORS(app)
 
 # Basic offline medical FAQ fallback
 MEDICAL_FAQ = {
     "fever symptoms": "Common symptoms include high temperature, sweating, chills, headache, and muscle aches.",
     "cold symptoms": "Sneezing, runny or stuffy nose, sore throat, coughing, mild headache, and fatigue.",
-    "covid symptoms": "Fever, dry cough, tiredness, loss of taste or smell, shortness of breath.",
-    "diabetes": "Diabetes is a chronic disease that occurs when your blood sugar is too high.",
-    "types of diabetes": "The main types are Type 1, Type 2, and gestational diabetes."
+    "covid symptoms": "Fever, dry cough, tiredness, loss of taste or smell, shortness of breath."
 }
 
-# List of abusive or negative words to detect politely
-ABUSIVE_WORDS = [
-    "stupid", "idiot", "dumb", "hate", "shut up", "ugly", "kill", "hate you"
-]
+# Basic greeting patterns
+GREETINGS = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+
+# Basic negative/abusive words (expand as needed)
+NEGATIVE_WORDS = {"stupid", "idiot", "dumb", "hate", "kill", "shut up"}
 
 def contains_abusive(text):
-    text = text.lower()
-    for word in ABUSIVE_WORDS:
-        if word in text:
-            return True
-    return False
+    text_lower = text.lower()
+    return any(word in text_lower for word in NEGATIVE_WORDS)
+
+def is_greeting(text):
+    text_lower = text.lower()
+    return any(greet in text_lower for greet in GREETINGS)
 
 def google_search_with_citations(query):
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
         return [], ""
-
     params = {
         "key": GOOGLE_SEARCH_KEY,
         "cx": GOOGLE_SEARCH_CX,
@@ -72,6 +71,7 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
+    # Get latest user message
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -79,31 +79,22 @@ def search_answer():
             break
 
     if not latest_user_message:
-        return jsonify({"answer": "No user message found in conversation.", "sources": []})
+        return jsonify({"answer": "No user message found.", "sources": []})
 
-    lower_msg = latest_user_message.lower()
+    # Handle greetings specially
+    if is_greeting(latest_user_message):
+        return jsonify({"answer": "Hi again! 👋 How can I help you today?", "sources": []})
 
-    # Check for abusive or negative language
-    if contains_abusive(lower_msg):
-        return jsonify({
-            "answer": "I’m here to help you kindly. Let’s keep the conversation respectful, please.",
-            "sources": []
-        })
+    # Handle abusive language politely
+    if contains_abusive(latest_user_message):
+        return jsonify({"answer": "I'm here to help, so please be kind. Let's keep our conversation respectful.", "sources": []})
 
-    # Check for greetings
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if any(greet in lower_msg for greet in greetings):
-        return jsonify({
-            "answer": "Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?",
-            "sources": []
-        })
-
-    # Check offline FAQ first
+    # Check offline FAQ fallback
     for key, answer in MEDICAL_FAQ.items():
-        if key in lower_msg:
+        if key in latest_user_message.lower():
             return jsonify({"answer": answer, "sources": []})
 
-    # Run Google Search to get citations
+    # Run Google Search for citations
     results, formatted_results = google_search_with_citations(latest_user_message)
 
     # Prepare prompt for Gemini
@@ -114,32 +105,26 @@ def search_answer():
         f"{formatted_results}\n"
     )
 
-    conversation_text = system_prompt + "Conversation:\n"
+    conversation_text = system_prompt + "\nConversation:\n"
     for msg in messages:
         role = "User" if msg["role"] == "user" else "Assistant"
         conversation_text += f"{role}: {msg['content']}\n"
     conversation_text += "Assistant:"
 
-    # Use Gemini if configured
-    if GEMINI_API_KEY:
-        try:
-            model = genai.GenerativeModel("gemini-2.5-flash-lite")
-            response = model.generate_text(conversation_text, temperature=0.3)
-            answer = response.text
-            return jsonify({"answer": answer, "sources": results})
-        except Exception as e:
-            print(f"Gemini error: {e}")
-            # fallback to offline or polite response below
-
-    # Fallback to offline FAQ (again, in case Google or Gemini failed)
-    return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
-
-@app.route("/")
-def serve_index():
-    return send_from_directory(app.static_folder, "medibot.html")
+    # Call Gemini API
+    try:
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        resp = model.generate_text(conversation_text)
+        answer = resp.text.strip()
+        return jsonify({"answer": answer, "sources": results})
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+        # Fallback generic message
+        return jsonify({"answer": "Sorry, I'm having trouble accessing information right now.", "sources": []})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
