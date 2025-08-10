@@ -67,6 +67,19 @@ def google_search_with_citations(query):
         formatted_results += f"{i}. {title}\n{snippet}\nSource: {link}\n\n"
     return results, formatted_results
 
+def find_last_medical_topic(messages):
+    medical_keywords = [
+        "diabetes", "fever", "cold", "covid", "symptoms", "treatment",
+        "headache", "infection", "pain", "cancer", "allergy", "asthma"
+    ]
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "").lower()
+            for keyword in medical_keywords:
+                if keyword in content:
+                    return keyword
+    return None
+
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
@@ -93,7 +106,7 @@ def search_answer():
         )
         return jsonify({"answer": polite_response, "sources": []})
 
-    # Handle simple greeting like "hi", "hello", etc.
+    # Handle simple greetings
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
         greeting_reply = "Hi! How may I help you with your medical questions today?"
@@ -102,11 +115,16 @@ def search_answer():
     # Run Google Search on latest user question for grounding
     results, formatted_results = google_search_with_citations(latest_user_message)
 
+    # Detect last medical topic from assistant messages to improve pronoun resolution
+    last_topic = find_last_medical_topic(messages)
+    topic_hint = f"The recent medical topic discussed is '{last_topic}'. " if last_topic else ""
+
     # Strong system prompt to improve context understanding
     system_prompt = (
         "You are a helpful and knowledgeable medical assistant chatbot. "
+        f"{topic_hint}"
         "When the user refers to something with pronouns like 'it', 'those', or says 'explain that', "
-        "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
+        "infer they mean the most recent medical topic or condition discussed earlier in the conversation. "
         "Always keep track of conversational context and references carefully. "
         "Answer the user's questions based on the following web search results. "
         "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
@@ -163,6 +181,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
