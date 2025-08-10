@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import openai
 import google.generativeai as genai
@@ -74,12 +75,15 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Get all user messages
-    user_messages = [msg.get("content", "").strip() for msg in messages if msg.get("role") == "user"]
-    if not user_messages:
-        return jsonify({"answer": "No user message found in conversation.", "sources": []})
+    # Get latest user message
+    latest_user_message = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            latest_user_message = msg.get("content", "").strip()
+            break
 
-    latest_user_message = user_messages[-1].lower()
+    if not latest_user_message:
+        return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
     # Check for abusive content in latest message
     if contains_abuse(latest_user_message):
@@ -89,43 +93,28 @@ def search_answer():
         )
         return jsonify({"answer": polite_response, "sources": []})
 
-    # Handle simple greetings
+    # Handle simple greeting like "hi", "hello", etc.
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if latest_user_message in greetings:
+    if latest_user_message.lower() in greetings:
         greeting_reply = "Hi! How may I help you with your medical questions today?"
         return jsonify({"answer": greeting_reply, "sources": []})
 
-    # Check for follow-up requests that likely refer to previous info
-    follow_up_keywords = ["explain", "elaborate", "those", "it", "more info", "more information", "details"]
-    if any(keyword in latest_user_message for keyword in follow_up_keywords):
-        # Try to find previous assistant answer and sources in conversation
-        previous_assistant_msg = None
-        previous_sources = []
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                previous_assistant_msg = msg.get("content", "")
-                break
-        # If found, respond with expanded info or just repeat last answer politely
-        if previous_assistant_msg:
-            answer = previous_assistant_msg + "\n\nIf you'd like more details, please specify your question further."
-            return jsonify({"answer": answer, "sources": previous_sources})
+    # Run Google Search on latest user question for grounding
+    results, formatted_results = google_search_with_citations(latest_user_message)
 
-    # Build search query from last 2-3 user messages to keep context
-    query = " ".join(user_messages[-3:])
-
-    # Run Google Search on the contextual query
-    results, formatted_results = google_search_with_citations(query)
-
-    # System prompt to guide the assistant and reduce hallucination
+    # Strong system prompt to improve context understanding
     system_prompt = (
-        "You are a helpful and knowledgeable medical assistant. "
+        "You are a helpful and knowledgeable medical assistant chatbot. "
+        "When the user refers to something with pronouns like 'it', 'those', or says 'explain that', "
+        "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
+        "Always keep track of conversational context and references carefully. "
         "Answer the user's questions based on the following web search results. "
         "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
         "Cite your sources with numbers like [1], [2], etc.\n\n"
         f"{formatted_results}\n"
     )
 
-    # Prepare messages for OpenAI or Gemini
+    # Prepare messages for LLM call: system prompt + full conversation history
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
 
@@ -147,7 +136,6 @@ def search_answer():
     # Use Gemini if OpenAI fails or quota exceeded
     if GEMINI_API_KEY:
         try:
-            # Gemini accepts plain text prompt; combine system + conversation
             conversation_text = system_prompt + "\nConversation:\n"
             for msg in messages:
                 role = "User" if msg["role"] == "user" else "Assistant"
@@ -161,9 +149,9 @@ def search_answer():
         except Exception as e:
             return jsonify({"answer": f"Gemini error: {e}", "sources": []})
 
-    # Fallback to offline FAQ
+    # Fallback offline FAQ (optional)
     for key, answer in MEDICAL_FAQ.items():
-        if key in latest_user_message:
+        if key in latest_user_message.lower():
             return jsonify({"answer": answer, "sources": []})
 
     return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
@@ -175,5 +163,6 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
