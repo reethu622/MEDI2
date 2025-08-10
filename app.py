@@ -1,8 +1,7 @@
 import os
-import re
 import requests
 import google.generativeai as genai
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # Load API keys from environment variables
@@ -13,33 +12,20 @@ GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Basic offline medical FAQ fallback
+# Simple offline fallback FAQ
 MEDICAL_FAQ = {
     "fever symptoms": "Common symptoms include high temperature, sweating, chills, headache, and muscle aches.",
     "cold symptoms": "Sneezing, runny or stuffy nose, sore throat, coughing, mild headache, and fatigue.",
     "covid symptoms": "Fever, dry cough, tiredness, loss of taste or smell, shortness of breath."
 }
 
-# Basic greeting patterns
-GREETINGS = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
-
-# Basic negative/abusive words (expand as needed)
-NEGATIVE_WORDS = {"stupid", "idiot", "dumb", "hate", "kill", "shut up"}
-
-def contains_abusive(text):
-    text_lower = text.lower()
-    return any(word in text_lower for word in NEGATIVE_WORDS)
-
-def is_greeting(text):
-    text_lower = text.lower()
-    return any(greet in text_lower for greet in GREETINGS)
-
 def google_search_with_citations(query):
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
         return [], ""
+
     params = {
         "key": GOOGLE_SEARCH_KEY,
         "cx": GOOGLE_SEARCH_CX,
@@ -71,33 +57,16 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Get latest user message
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
             latest_user_message = msg.get("content", "").strip()
             break
-
     if not latest_user_message:
-        return jsonify({"answer": "No user message found.", "sources": []})
+        return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
-    # Handle greetings specially
-    if is_greeting(latest_user_message):
-        return jsonify({"answer": "Hi again! 👋 How can I help you today?", "sources": []})
-
-    # Handle abusive language politely
-    if contains_abusive(latest_user_message):
-        return jsonify({"answer": "I'm here to help, so please be kind. Let's keep our conversation respectful.", "sources": []})
-
-    # Check offline FAQ fallback
-    for key, answer in MEDICAL_FAQ.items():
-        if key in latest_user_message.lower():
-            return jsonify({"answer": answer, "sources": []})
-
-    # Run Google Search for citations
     results, formatted_results = google_search_with_citations(latest_user_message)
 
-    # Prepare prompt for Gemini
     system_prompt = (
         "You are a helpful and knowledgeable medical assistant. "
         "Answer the user's questions based on the following web search results. "
@@ -111,20 +80,31 @@ def search_answer():
         conversation_text += f"{role}: {msg['content']}\n"
     conversation_text += "Assistant:"
 
-    # Call Gemini API
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
-        resp = model.generate_text(conversation_text)
-        answer = resp.text.strip()
-        return jsonify({"answer": answer, "sources": results})
-    except Exception as e:
-        print(f"Gemini API error: {e}")
-        # Fallback generic message
-        return jsonify({"answer": "Sorry, I'm having trouble accessing information right now.", "sources": []})
+    if GEMINI_API_KEY:
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_text(conversation_text)
+            answer = resp.text
+            return jsonify({"answer": answer, "sources": results})
+        except Exception as e:
+            return jsonify({"answer": f"Gemini error: {e}", "sources": []})
+
+    # Offline FAQ fallback
+    for key, answer in MEDICAL_FAQ.items():
+        if key in latest_user_message.lower():
+            return jsonify({"answer": answer, "sources": []})
+
+    return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
+
+# Add this route to serve your frontend at /
+@app.route("/")
+def index():
+    return send_from_directory("static", "medibot.html")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
+
 
 
 
