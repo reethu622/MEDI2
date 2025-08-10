@@ -116,6 +116,12 @@
     color: #1E90FF;
     text-decoration: none;
   }
+  #loading {
+    margin-top: 8px;
+    color: #555;
+    font-style: italic;
+    display: none;
+  }
 </style>
 </head>
 <body>
@@ -129,11 +135,13 @@
       <svg class="send-icon" viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></svg>
     </button>
   </form>
+  <div id="loading">Medibot is typing...</div>
 
 <script>
   const chatBox = document.getElementById("chat-box");
   const chatForm = document.getElementById("chat-form");
   const userInput = document.getElementById("user-input");
+  const loadingDiv = document.getElementById("loading");
 
   // Initialize messages with system greeting (system prompt is in backend, here for UI context)
   const messages = [
@@ -169,7 +177,8 @@
 
     appendMessage(question, "user");
     userInput.value = "";
-    userInput.disabled = true;
+
+    loadingDiv.style.display = "block";
 
     try {
       const response = await fetch("/api/v1/search_answer", {
@@ -183,7 +192,7 @@
       appendMessage("Error: Unable to get response.", "bot");
       console.error(err);
     } finally {
-      userInput.disabled = false;
+      loadingDiv.style.display = "none";
       userInput.focus();
     }
   }
@@ -197,4 +206,5 @@
 </script>
 </body>
 </html>
+
 
