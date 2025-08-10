@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 import openai
 import google.generativeai as genai
@@ -75,15 +74,12 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Get latest user message
-    latest_user_message = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            latest_user_message = msg.get("content", "").strip()
-            break
-
-    if not latest_user_message:
+    # Get all user messages
+    user_messages = [msg.get("content", "").strip() for msg in messages if msg.get("role") == "user"]
+    if not user_messages:
         return jsonify({"answer": "No user message found in conversation.", "sources": []})
+
+    latest_user_message = user_messages[-1].lower()
 
     # Check for abusive content in latest message
     if contains_abuse(latest_user_message):
@@ -93,14 +89,32 @@ def search_answer():
         )
         return jsonify({"answer": polite_response, "sources": []})
 
-    # Handle simple greeting like "hi", "hello", etc.
+    # Handle simple greetings
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if latest_user_message.lower() in greetings:
+    if latest_user_message in greetings:
         greeting_reply = "Hi! How may I help you with your medical questions today?"
         return jsonify({"answer": greeting_reply, "sources": []})
 
-    # Run Google Search on latest user question for grounding
-    results, formatted_results = google_search_with_citations(latest_user_message)
+    # Check for follow-up requests that likely refer to previous info
+    follow_up_keywords = ["explain", "elaborate", "those", "it", "more info", "more information", "details"]
+    if any(keyword in latest_user_message for keyword in follow_up_keywords):
+        # Try to find previous assistant answer and sources in conversation
+        previous_assistant_msg = None
+        previous_sources = []
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                previous_assistant_msg = msg.get("content", "")
+                break
+        # If found, respond with expanded info or just repeat last answer politely
+        if previous_assistant_msg:
+            answer = previous_assistant_msg + "\n\nIf you'd like more details, please specify your question further."
+            return jsonify({"answer": answer, "sources": previous_sources})
+
+    # Build search query from last 2-3 user messages to keep context
+    query = " ".join(user_messages[-3:])
+
+    # Run Google Search on the contextual query
+    results, formatted_results = google_search_with_citations(query)
 
     # System prompt to guide the assistant and reduce hallucination
     system_prompt = (
@@ -149,7 +163,7 @@ def search_answer():
 
     # Fallback to offline FAQ
     for key, answer in MEDICAL_FAQ.items():
-        if key in latest_user_message.lower():
+        if key in latest_user_message:
             return jsonify({"answer": answer, "sources": []})
 
     return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
@@ -161,4 +175,5 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
