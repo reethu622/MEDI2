@@ -19,20 +19,19 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
 
 def contains_abuse(text):
     text = text.lower()
-    for word in ABUSIVE_WORDS:
-        if word in text:
-            return True
-    return False
+    return any(word in text for word in ABUSIVE_WORDS)
 
 def google_search_with_citations(query, num_results=5):
-    """Perform Google Custom Search and return results with formatted citations."""
+    """
+    Perform Google Custom Search and return a list of dicts:
+    [{title, snippet, link}, ...]
+    """
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
-        return [], ""  # Skip search if keys missing
+        return []
 
     params = {
         "key": GOOGLE_SEARCH_KEY,
@@ -46,70 +45,68 @@ def google_search_with_citations(query, num_results=5):
         data = r.json()
     except Exception as e:
         print(f"Google Search API error: {e}")
-        return [], ""
+        return []
 
     results = []
-    formatted_results = ""
-    for i, item in enumerate(data.get("items", []), start=1):
-        title = item.get("title", "")
-        snippet = item.get("snippet", "")
-        link = item.get("link", "")
-        results.append({"title": title, "snippet": snippet, "link": link})
-        formatted_results += f"[{i}] {title}\n{snippet}\nSource: {link}\n\n"
-    return results, formatted_results
+    for item in data.get("items", []):
+        results.append({
+            "title": item.get("title", ""),
+            "snippet": item.get("snippet", ""),
+            "link": item.get("link", "")
+        })
+    return results
 
 def is_answer_incomplete(answer_text, user_query):
     """
-    Simple heuristic to check if answer is incomplete:
-    - If answer contains apology phrases or "I don't know"
-    - Or if key question words are missing in answer
+    Basic check if the answer is incomplete or uncertain.
     """
     answer_lower = answer_text.lower()
     if any(phrase in answer_lower for phrase in ["sorry", "don't know", "cannot find", "need more information"]):
         return True
 
-    # Optional: add domain-specific checks for missing info keywords
-    # For example, if user asks about "types" but answer doesn't mention "type"
     question_keywords = ["type", "types", "explain", "list", "what are", "different kinds", "kinds"]
     if any(word in user_query.lower() for word in question_keywords):
-        if "type" not in answer_lower and "kind" not in answer_lower and "explain" not in answer_lower:
+        if all(x not in answer_lower for x in ["type", "kind", "explain"]):
             return True
 
     return False
 
 def generate_answer_with_sources(messages, results):
-    """Generate an answer using OpenAI or Gemini based on search results and conversation."""
-    # Compose system prompt with web results
+    """
+    Generate answer from the LLM with web search results context and
+    with pronoun resolution system prompt to track context.
+    """
+    # Format the web results with numbering to allow citation [1], [2], etc.
     formatted_results_text = ""
     for idx, item in enumerate(results, start=1):
         formatted_results_text += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
 
     system_prompt = (
-        "You are a helpful and knowledgeable medical assistant chatbot. "
+        "You are Medibot, a helpful and knowledgeable medical assistant chatbot. "
         "When the user uses pronouns like 'it', 'those', 'these', or says 'explain that', "
         "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
-        "Always keep track of conversational context carefully. "
+        "Always keep track of conversational context carefully and do not guess unrelated topics. "
         "Answer the user's questions based on the following web search results. "
         "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
-        "Cite your sources with numbers like [1], [2], etc.\n\n"
+        "Cite your sources using the numbers [1], [2], etc. as given below.\n\n"
         f"{formatted_results_text}\n"
     )
 
-    # Prepare messages for LLM call
-    openai_messages = [{"role": "system", "content": system_prompt}]
-    openai_messages.extend(messages)
+    # Prepare full messages list for LLM
+    llm_messages = [{"role": "system", "content": system_prompt}] + messages
 
-    # Try OpenAI first
+    # Try OpenAI GPT first
     if OPENAI_API_KEY:
         try:
             resp = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
-                messages=openai_messages,
+                messages=llm_messages,
                 temperature=0.3,
             )
-            answer = resp.choices[0].message["content"]
+            answer = resp.choices[0].message["content"].strip()
             return answer
         except Exception as e:
+            print(f"OpenAI error: {e}")
             if "quota" not in str(e).lower():
                 return f"OpenAI error: {e}"
 
@@ -123,11 +120,12 @@ def generate_answer_with_sources(messages, results):
             conversation_text += "Assistant:"
             model = genai.GenerativeModel("gemini-1.5-flash")
             resp = model.generate_content(conversation_text)
-            return resp.text
+            return resp.text.strip()
         except Exception as e:
+            print(f"Gemini error: {e}")
             return f"Gemini error: {e}"
 
-    # If no LLM keys, return fallback message
+    # No LLM keys present
     return "I don't know. Please consult a medical professional."
 
 @app.route("/api/v1/search_answer", methods=["POST"])
@@ -137,38 +135,35 @@ def search_answer():
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Find latest user message
-    latest_user_message = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            latest_user_message = msg.get("content", "").strip()
-            break
-
+    # Extract latest user query for search and abuse check
+    latest_user_message = next((msg["content"].strip() for msg in reversed(messages) if msg.get("role") == "user"), None)
     if not latest_user_message:
         return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
     if contains_abuse(latest_user_message):
-        polite_response = (
-            "I am here to help with medical questions. "
-            "Please keep the conversation respectful. How can I assist you today?"
-        )
-        return jsonify({"answer": polite_response, "sources": []})
+        return jsonify({
+            "answer": "I am here to help with medical questions. Please keep the conversation respectful. How can I assist you today?",
+            "sources": []
+        })
 
-    # Greetings quick response
+    # Quick greeting responses
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    # 1. First try limited Google Custom Search (5 results)
-    results, _ = google_search_with_citations(latest_user_message, num_results=5)
+    # Step 1: Limited Google Custom Search (5 results)
+    results = google_search_with_citations(latest_user_message, num_results=5)
+
+    # Step 2: Generate answer using those results
     answer = generate_answer_with_sources(messages, results)
 
-    # 2. If answer incomplete, fallback to broader search (15 results)
+    # Step 3: If answer incomplete, fallback to broader search (15 results)
     if is_answer_incomplete(answer, latest_user_message):
-        fallback_results, _ = google_search_with_citations(latest_user_message, num_results=15)
+        fallback_results = google_search_with_citations(latest_user_message, num_results=15)
         answer = generate_answer_with_sources(messages, fallback_results)
         return jsonify({"answer": answer, "sources": fallback_results})
 
+    # Step 4: Return answer and sources
     return jsonify({"answer": answer, "sources": results})
 
 @app.route("/")
@@ -178,6 +173,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
