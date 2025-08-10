@@ -105,19 +105,23 @@ def search_answer():
             print("⚠ OpenAI quota exceeded, switching to Gemini...")
 
     # Use Gemini if OpenAI fails or quota exceeded
-  if GEMINI_API_KEY:
-    try:
-        conversation_text = system_prompt + "\nConversation:\n"
+    if GEMINI_API_KEY:
+        
+        try:
+
+            
+           conversation_text = system_prompt + "\nConversation:\n"
         for msg in messages:
+            
             role = "User" if msg["role"] == "user" else "Assistant"
             conversation_text += f"{role}: {msg['content']}\n"
-        conversation_text += "Assistant:"
+            conversation_text += "Assistant:"
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_text(conversation_text)  # <- fix here
-        answer = resp.text
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_text(conversation_text)  # <- fix here
+            answer = resp.text
         return jsonify({"answer": answer, "sources": results})
-    except Exception as e:
+       except Exception as e:
         return jsonify({"answer": f"Gemini error: {e}", "sources": []})
 
 
