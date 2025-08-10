@@ -2,6 +2,5 @@ flask
 flask-cors
 requests
 google-generativeai
-openai
+better_profanity
 gunicorn
-pyngrok
