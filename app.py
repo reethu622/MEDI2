@@ -1,109 +1,172 @@
 import os
-from flask import Flask, request, jsonify, send_from_directory
-from better_profanity import profanity
-from flask_cors import CORS
+import re
 import requests
+import openai
 import google.generativeai as genai
-
-app = Flask(__name__)
-CORS(app)
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 
 # Load API keys from environment variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_SEARCH_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_SEARCH_CX")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY", "")
+GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable not set")
-if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-    raise RuntimeError("Google API key and CSE ID must be set")
+# Configure OpenAI and Gemini if keys are present
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# Configure Google Gemini (Generative AI)
-genai.configure(api_key=GEMINI_API_KEY)
+app = Flask(__name__, static_folder="static")
+CORS(app)
 
-# Load profanity filter
-profanity.load_censor_words()
+# Basic offline medical FAQ fallback
+MEDICAL_FAQ = {
+    "fever symptoms": "Common symptoms include high temperature, sweating, chills, headache, and muscle aches.",
+    "cold symptoms": "Sneezing, runny or stuffy nose, sore throat, coughing, mild headache, and fatigue.",
+    "covid symptoms": "Fever, dry cough, tiredness, loss of taste or smell, shortness of breath."
+}
 
-def google_search(query, num_results=3):
-    """Perform Google Custom Search and return list of results with title/link."""
-    search_url = "https://www.googleapis.com/customsearch/v1"
+# Basic abusive word list (expand as needed)
+ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
+
+def contains_abuse(text):
+    text = text.lower()
+    for word in ABUSIVE_WORDS:
+        if word in text:
+            return True
+    return False
+
+def google_search_with_citations(query):
+    """Perform Google Custom Search and return results with formatted citations."""
+    if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
+        return [], ""  # Skip search if keys missing
+
     params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
+        "key": GOOGLE_SEARCH_KEY,
+        "cx": GOOGLE_SEARCH_CX,
         "q": query,
-        "num": num_results,
+        "num": 5
     }
-    resp = requests.get(search_url, params=params)
-    results = []
-    if resp.status_code == 200:
-        data = resp.json()
-        items = data.get("items", [])
-        for item in items:
-            results.append({
-                "title": item.get("title"),
-                "link": item.get("link")
-            })
-    return results
-
-def generate_gemini_response(prompt):
-    """Use Google Gemini to generate AI response."""
     try:
-        response = genai.generate_text(
-            model="gemini-2.0-flash",
-            prompt=prompt,
-            temperature=0.7,
-            max_output_tokens=300
-        )
-        return response.text
+        r = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        print(f"Gemini API error: {e}")
-        return "Sorry, I am having trouble generating a response right now."
+        print(f"Google Search API error: {e}")
+        return [], ""
 
-@app.route("/")
-def index():
-    return send_from_directory("static", "medibot.html")  # your frontend file
+    results = []
+    formatted_results = ""
+    for i, item in enumerate(data.get("items", []), start=1):
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        results.append({"title": title, "snippet": snippet, "link": link})
+        formatted_results += f"{i}. {title}\n{snippet}\nSource: {link}\n\n"
+    return results, formatted_results
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
-    messages = data.get("messages", [])
-    user_message = messages[-1]["content"] if messages else ""
 
-    # Profanity filter
-    if profanity.contains_profanity(user_message):
-        return jsonify({
-            "answer": "Please avoid using inappropriate language. How can I assist you politely?",
-            "sources": []
-        })
+    messages = data.get("messages")
+    if not messages or not isinstance(messages, list):
+        return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Greeting detection
-    greetings = ["hi", "hello", "hey", "hola", "howdy"]
-    if any(user_message.lower().startswith(greet) for greet in greetings):
-        return jsonify({
-            "answer": "Hi! 👋 How can I help you today?",
-            "sources": []
-        })
+    # Get latest user message
+    latest_user_message = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            latest_user_message = msg.get("content", "").strip()
+            break
 
-    # Keywords for AI explanations
-    ai_keywords = ["type", "explain", "definition", "meaning", "what is", "how does", "describe", "tell me about"]
-    if any(kw in user_message.lower() for kw in ai_keywords):
-        answer = generate_gemini_response(user_message)
-        return jsonify({
-            "answer": answer,
-            "sources": []
-        })
+    if not latest_user_message:
+        return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
-    # Otherwise, fallback to Google Search results
-    sources = google_search(user_message)
-    answer = "Here are some results I found related to your question."
-    return jsonify({
-        "answer": answer,
-        "sources": sources
-    })
+    # Check for abusive content in latest message
+    if contains_abuse(latest_user_message):
+        polite_response = (
+            "I am here to help with medical questions. "
+            "Please keep the conversation respectful. How can I assist you today?"
+        )
+        return jsonify({"answer": polite_response, "sources": []})
+
+    # Handle simple greeting like "hi", "hello", etc.
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    if latest_user_message.lower() in greetings:
+        greeting_reply = "Hi! How may I help you with your medical questions today?"
+        return jsonify({"answer": greeting_reply, "sources": []})
+
+    # Run Google Search on latest user question for grounding
+    results, formatted_results = google_search_with_citations(latest_user_message)
+
+    # Strong system prompt to improve context understanding
+    system_prompt = (
+        "You are a helpful and knowledgeable medical assistant chatbot. "
+        "When the user refers to something with pronouns like 'it', 'those', or says 'explain that', "
+        "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
+        "Always keep track of conversational context and references carefully. "
+        "Answer the user's questions based on the following web search results. "
+        "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
+        "Cite your sources with numbers like [1], [2], etc.\n\n"
+        f"{formatted_results}\n"
+    )
+
+    # Prepare messages for LLM call: system prompt + full conversation history
+    openai_messages = [{"role": "system", "content": system_prompt}]
+    openai_messages.extend(messages)
+
+    # Use OpenAI if available
+    if OPENAI_API_KEY:
+        try:
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=openai_messages,
+                temperature=0.3,
+            )
+            answer = resp.choices[0].message["content"]
+            return jsonify({"answer": answer, "sources": results})
+        except Exception as e:
+            if "quota" not in str(e).lower():
+                return jsonify({"answer": f"OpenAI error: {e}", "sources": []})
+            print("⚠ OpenAI quota exceeded, switching to Gemini...")
+
+    # Use Gemini if OpenAI fails or quota exceeded
+    if GEMINI_API_KEY:
+        try:
+            conversation_text = system_prompt + "\nConversation:\n"
+            for msg in messages:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                conversation_text += f"{role}: {msg['content']}\n"
+            conversation_text += "Assistant:"
+
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_content(conversation_text)
+            answer = resp.text
+            return jsonify({"answer": answer, "sources": results})
+        except Exception as e:
+            return jsonify({"answer": f"Gemini error: {e}", "sources": []})
+
+    # Fallback offline FAQ (optional)
+    for key, answer in MEDICAL_FAQ.items():
+        if key in latest_user_message.lower():
+            return jsonify({"answer": answer, "sources": []})
+
+    return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
+
+@app.route("/")
+def serve_index():
+    return send_from_directory(app.static_folder, "medibot.html")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
+
+
+
 
 
 
