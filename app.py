@@ -5,12 +5,12 @@ import google.generativeai as genai
 app = Flask(__name__)
 
 # Load API key from environment variable
-GENAI_API_KEY = os.getenv("GOOGLE_GENAI_API_KEY")
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GENAI_API_KEY:
-    raise RuntimeError("GOOGLE_GENAI_API_KEY environment variable not set")
+    raise RuntimeError("GEMINI_API_KEY environment variable not set")
 
 # Configure the Google Generative AI client
-genai.configure(api_key=GENAI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 
 @app.route("/generate", methods=["POST"])
 def generate():
