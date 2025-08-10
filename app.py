@@ -1,115 +1,93 @@
 import os
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
 import requests
+from flask import Flask, request, jsonify, send_from_directory
 
-app = Flask(__name__)
-CORS(app)
+app = Flask(__name__, static_folder="static")
 
-# Load API keys from Railway variables
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Expanded list of reliable medical sources
-SEARCH_SITES = (
-    "site:mayoclinic.org OR site:webmd.com OR site:nih.gov OR "
-    "site:who.int OR site:cdc.gov OR site:clevelandclinic.org OR site:medlineplus.gov"
-)
-
-# Keep conversation context in memory
-conversation_history = []
-
+# ✅ Trusted sources including Wikipedia
+trusted_sites = [
+    "site:mayoclinic.org",
+    "site:webmd.com",
+    "site:nih.gov",
+    "site:who.int",
+    "site:health.harvard.edu",
+    "site:cdc.gov",
+    "site:clevelandclinic.org",
+    "site:medlineplus.gov",
+    "site:wikipedia.org"
+]
 
 def google_search(query):
-    """Perform a Google Custom Search limited to our trusted medical sites."""
+    """Searches Google Custom Search restricted to trusted sources."""
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
         "key": GOOGLE_API_KEY,
         "cx": GOOGLE_CSE_ID,
-        "q": f"{query} {SEARCH_SITES}",
-        "num": 5
+        "q": query
     }
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    results = []
-    if "items" in data:
-        for item in data["items"]:
-            results.append({
-                "title": item.get("title"),
-                "link": item.get("link"),
-                "snippet": item.get("snippet")
-            })
-    return results
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    return response.json()
 
-
-def generate_answer(prompt):
-    """Generate answer using Gemini API."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
+def get_gemini_answer(question, context):
+    """Calls Gemini API to generate answer based on context."""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
     headers = {"Content-Type": "application/json"}
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}]
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [{
+            "parts": [{"text": f"Answer the following medical question:\n\nQuestion: {question}\n\nSources:\n{context}"}]
+        }]
     }
-    resp = requests.post(url, headers=headers, json=body)
+    resp = requests.post(url, headers=headers, params=params, json=payload)
     resp.raise_for_status()
     data = resp.json()
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError):
-        return "Sorry, I couldn't process the answer."
-
+        return "Sorry, I couldn't generate an answer."
 
 @app.route("/")
 def index():
-    # Serve HTML file from static folder
-    return send_from_directory("static", "medibot.html")
-
+    return send_from_directory(app.static_folder, "medibot.html")
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
-    global conversation_history
-    data = request.get_json()
-    messages = data.get("messages", [])
+    data = request.json
+    if not data or "messages" not in data:
+        return jsonify({"error": "Invalid request"}), 400
 
-    if not messages:
-        return jsonify({"answer": "No question received.", "sources": []})
+    user_question = ""
+    for msg in data["messages"]:
+        if msg["role"] == "user":
+            user_question = msg["content"]
 
-    # Extract the latest user question
-    latest_message = messages[-1]["content"]
+    if not user_question:
+        return jsonify({"error": "No question found"}), 400
 
-    # Handle pronouns like "it" or "that"
-    if latest_message.lower() in ["it", "that", "they", "those"] or latest_message.lower().startswith(("what are the types", "tell me more")):
-        # Find the last medical topic mentioned in the conversation
-        for msg in reversed(conversation_history):
-            if msg["role"] == "user" and not any(word in msg["content"].lower() for word in ["it", "that", "they", "those"]):
-                latest_message = latest_message.replace("it", msg["content"])
-                break
+    # Build query restricted to trusted sites
+    query = f"{user_question} {' OR '.join(trusted_sites)}"
 
-    # Add latest user question to conversation history
-    conversation_history.append({"role": "user", "content": latest_message})
+    try:
+        # Google Custom Search
+        search_results = google_search(query)
+        items = search_results.get("items", [])
+        sources = [{"title": i["title"], "link": i["link"]} for i in items[:5]]
+        context_text = "\n".join([f"{i['title']}: {i['link']}" for i in sources])
 
-    # Search Google Custom Search for reliable info
-    search_results = google_search(latest_message)
+        # Gemini AI Answer
+        answer = get_gemini_answer(user_question, context_text)
 
-    # Prepare search summary for Gemini
-    search_text = "\n".join([f"{item['title']} - {item['snippet']}" for item in search_results])
+        return jsonify({"answer": answer, "sources": sources})
 
-    # Ask Gemini to answer based on the search results
-    prompt = (
-        f"You are Medibot, a helpful medical assistant.\n\n"
-        f"User asked: {latest_message}\n\n"
-        f"Here are some relevant sources:\n{search_text}\n\n"
-        "Please give a concise, factual, and easy-to-understand answer for the user."
-    )
-    answer = generate_answer(prompt)
-
-    # Add bot answer to conversation history
-    conversation_history.append({"role": "assistant", "content": answer})
-
-    return jsonify({"answer": answer, "sources": search_results})
-
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
+
 
