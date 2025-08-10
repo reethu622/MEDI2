@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 import openai
 import google.generativeai as genai
@@ -12,7 +11,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY", "")
 GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
 
-# Configure OpenAI and Gemini if keys are present
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 if GEMINI_API_KEY:
@@ -21,14 +19,7 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Basic offline medical FAQ fallback
-MEDICAL_FAQ = {
-    "fever symptoms": "Common symptoms include high temperature, sweating, chills, headache, and muscle aches.",
-    "cold symptoms": "Sneezing, runny or stuffy nose, sore throat, coughing, mild headache, and fatigue.",
-    "covid symptoms": "Fever, dry cough, tiredness, loss of taste or smell, shortness of breath."
-}
-
-# Basic abusive word list (expand as needed)
+# Basic abusive words list (expand as needed)
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
 
 def contains_abuse(text):
@@ -38,7 +29,7 @@ def contains_abuse(text):
             return True
     return False
 
-def google_search_with_citations(query):
+def google_search_with_citations(query, num_results=5):
     """Perform Google Custom Search and return results with formatted citations."""
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
         return [], ""  # Skip search if keys missing
@@ -47,7 +38,7 @@ def google_search_with_citations(query):
         "key": GOOGLE_SEARCH_KEY,
         "cx": GOOGLE_SEARCH_CX,
         "q": query,
-        "num": 5
+        "num": num_results
     }
     try:
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
@@ -64,18 +55,89 @@ def google_search_with_citations(query):
         snippet = item.get("snippet", "")
         link = item.get("link", "")
         results.append({"title": title, "snippet": snippet, "link": link})
-        formatted_results += f"{i}. {title}\n{snippet}\nSource: {link}\n\n"
+        formatted_results += f"[{i}] {title}\n{snippet}\nSource: {link}\n\n"
     return results, formatted_results
+
+def is_answer_incomplete(answer_text, user_query):
+    """
+    Simple heuristic to check if answer is incomplete:
+    - If answer contains apology phrases or "I don't know"
+    - Or if key question words are missing in answer
+    """
+    answer_lower = answer_text.lower()
+    if any(phrase in answer_lower for phrase in ["sorry", "don't know", "cannot find", "need more information"]):
+        return True
+
+    # Optional: add domain-specific checks for missing info keywords
+    # For example, if user asks about "types" but answer doesn't mention "type"
+    question_keywords = ["type", "types", "explain", "list", "what are", "different kinds", "kinds"]
+    if any(word in user_query.lower() for word in question_keywords):
+        if "type" not in answer_lower and "kind" not in answer_lower and "explain" not in answer_lower:
+            return True
+
+    return False
+
+def generate_answer_with_sources(messages, results):
+    """Generate an answer using OpenAI or Gemini based on search results and conversation."""
+    # Compose system prompt with web results
+    formatted_results_text = ""
+    for idx, item in enumerate(results, start=1):
+        formatted_results_text += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
+
+    system_prompt = (
+        "You are a helpful and knowledgeable medical assistant chatbot. "
+        "When the user uses pronouns like 'it', 'those', 'these', or says 'explain that', "
+        "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
+        "Always keep track of conversational context carefully. "
+        "Answer the user's questions based on the following web search results. "
+        "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
+        "Cite your sources with numbers like [1], [2], etc.\n\n"
+        f"{formatted_results_text}\n"
+    )
+
+    # Prepare messages for LLM call
+    openai_messages = [{"role": "system", "content": system_prompt}]
+    openai_messages.extend(messages)
+
+    # Try OpenAI first
+    if OPENAI_API_KEY:
+        try:
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=openai_messages,
+                temperature=0.3,
+            )
+            answer = resp.choices[0].message["content"]
+            return answer
+        except Exception as e:
+            if "quota" not in str(e).lower():
+                return f"OpenAI error: {e}"
+
+    # Fallback to Gemini
+    if GEMINI_API_KEY:
+        try:
+            conversation_text = system_prompt + "\nConversation:\n"
+            for msg in messages:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                conversation_text += f"{role}: {msg['content']}\n"
+            conversation_text += "Assistant:"
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_content(conversation_text)
+            return resp.text
+        except Exception as e:
+            return f"Gemini error: {e}"
+
+    # If no LLM keys, return fallback message
+    return "I don't know. Please consult a medical professional."
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
-
     messages = data.get("messages")
     if not messages or not isinstance(messages, list):
         return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
 
-    # Get latest user message
+    # Find latest user message
     latest_user_message = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -85,7 +147,6 @@ def search_answer():
     if not latest_user_message:
         return jsonify({"answer": "No user message found in conversation.", "sources": []})
 
-    # Check for abusive content in latest message
     if contains_abuse(latest_user_message):
         polite_response = (
             "I am here to help with medical questions. "
@@ -93,71 +154,22 @@ def search_answer():
         )
         return jsonify({"answer": polite_response, "sources": []})
 
+    # Greetings quick response
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
-        greeting_reply = "Hi! How may I help you with your medical questions today?"
-        return jsonify({"answer": greeting_reply, "sources": []})
+        return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
-    # Run Google Search on latest user question for grounding
-    results, formatted_results = google_search_with_citations(latest_user_message)
+    # 1. First try limited Google Custom Search (5 results)
+    results, _ = google_search_with_citations(latest_user_message, num_results=5)
+    answer = generate_answer_with_sources(messages, results)
 
-    # Strong system prompt to force citation from results only
-    system_prompt = (
-        "You are a helpful medical assistant chatbot. Answer the user's medical question ONLY using the numbered search results below. "
-        "Cite your sources explicitly using [1], [2], etc., corresponding to the numbers of the search results. "
-        "If the answer cannot be found in the search results, say you don't know and recommend consulting a healthcare professional.\n\n"
-        f"{formatted_results}\n"
-    )
+    # 2. If answer incomplete, fallback to broader search (15 results)
+    if is_answer_incomplete(answer, latest_user_message):
+        fallback_results, _ = google_search_with_citations(latest_user_message, num_results=15)
+        answer = generate_answer_with_sources(messages, fallback_results)
+        return jsonify({"answer": answer, "sources": fallback_results})
 
-    # Prepare messages for OpenAI
-    openai_messages = [{"role": "system", "content": system_prompt}]
-    openai_messages.extend(messages)
-
-    if OPENAI_API_KEY:
-        try:
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=openai_messages,
-                temperature=0.3,
-            )
-            answer = resp.choices[0].message["content"]
-
-            # Extract cited source numbers from answer
-            cited_nums = set(int(n) for n in re.findall(r"\[(\d+)\]", answer))
-            filtered_sources = [results[i-1] for i in cited_nums if 0 < i <= len(results)]
-
-            return jsonify({"answer": answer, "sources": filtered_sources})
-        except Exception as e:
-            if "quota" not in str(e).lower():
-                return jsonify({"answer": f"OpenAI error: {e}", "sources": []})
-            print("⚠ OpenAI quota exceeded, switching to Gemini...")
-
-    # Use Gemini if OpenAI fails or quota exceeded
-    if GEMINI_API_KEY:
-        try:
-            conversation_text = system_prompt + "\nConversation:\n"
-            for msg in messages:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                conversation_text += f"{role}: {msg['content']}\n"
-            conversation_text += "Assistant:"
-
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            resp = model.generate_content(conversation_text)
-            answer = resp.text
-
-            cited_nums = set(int(n) for n in re.findall(r"\[(\d+)\]", answer))
-            filtered_sources = [results[i-1] for i in cited_nums if 0 < i <= len(results)]
-
-            return jsonify({"answer": answer, "sources": filtered_sources})
-        except Exception as e:
-            return jsonify({"answer": f"Gemini error: {e}", "sources": []})
-
-    # Fallback offline FAQ (optional)
-    for key, answer in MEDICAL_FAQ.items():
-        if key in latest_user_message.lower():
-            return jsonify({"answer": answer, "sources": []})
-
-    return jsonify({"answer": "I don't know. Please consult a medical professional.", "sources": []})
+    return jsonify({"answer": answer, "sources": results})
 
 @app.route("/")
 def serve_index():
@@ -166,6 +178,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
