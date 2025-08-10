@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from better_profanity import profanity
 from flask_cors import CORS
 import requests
-from google import genai  # your import style
+import google.generativeai as genai  # your import style
 
 app = Flask(__name__)
 CORS(app)
