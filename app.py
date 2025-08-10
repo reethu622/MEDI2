@@ -67,19 +67,6 @@ def google_search_with_citations(query):
         formatted_results += f"{i}. {title}\n{snippet}\nSource: {link}\n\n"
     return results, formatted_results
 
-def find_last_medical_topic(messages):
-    medical_keywords = [
-        "diabetes", "fever", "cold", "covid", "symptoms", "treatment",
-        "headache", "infection", "pain", "cancer", "allergy", "asthma"
-    ]
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "").lower()
-            for keyword in medical_keywords:
-                if keyword in content:
-                    return keyword
-    return None
-
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
     data = request.get_json()
@@ -106,7 +93,6 @@ def search_answer():
         )
         return jsonify({"answer": polite_response, "sources": []})
 
-    # Handle simple greetings
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
         greeting_reply = "Hi! How may I help you with your medical questions today?"
@@ -115,28 +101,18 @@ def search_answer():
     # Run Google Search on latest user question for grounding
     results, formatted_results = google_search_with_citations(latest_user_message)
 
-    # Detect last medical topic from assistant messages to improve pronoun resolution
-    last_topic = find_last_medical_topic(messages)
-    topic_hint = f"The recent medical topic discussed is '{last_topic}'. " if last_topic else ""
-
-    # Strong system prompt to improve context understanding
+    # Strong system prompt to force citation from results only
     system_prompt = (
-        "You are a helpful and knowledgeable medical assistant chatbot. "
-        f"{topic_hint}"
-        "When the user refers to something with pronouns like 'it', 'those', or says 'explain that', "
-        "infer they mean the most recent medical topic or condition discussed earlier in the conversation. "
-        "Always keep track of conversational context and references carefully. "
-        "Answer the user's questions based on the following web search results. "
-        "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
-        "Cite your sources with numbers like [1], [2], etc.\n\n"
+        "You are a helpful medical assistant chatbot. Answer the user's medical question ONLY using the numbered search results below. "
+        "Cite your sources explicitly using [1], [2], etc., corresponding to the numbers of the search results. "
+        "If the answer cannot be found in the search results, say you don't know and recommend consulting a healthcare professional.\n\n"
         f"{formatted_results}\n"
     )
 
-    # Prepare messages for LLM call: system prompt + full conversation history
+    # Prepare messages for OpenAI
     openai_messages = [{"role": "system", "content": system_prompt}]
     openai_messages.extend(messages)
 
-    # Use OpenAI if available
     if OPENAI_API_KEY:
         try:
             resp = openai.ChatCompletion.create(
@@ -145,7 +121,12 @@ def search_answer():
                 temperature=0.3,
             )
             answer = resp.choices[0].message["content"]
-            return jsonify({"answer": answer, "sources": results})
+
+            # Extract cited source numbers from answer
+            cited_nums = set(int(n) for n in re.findall(r"\[(\d+)\]", answer))
+            filtered_sources = [results[i-1] for i in cited_nums if 0 < i <= len(results)]
+
+            return jsonify({"answer": answer, "sources": filtered_sources})
         except Exception as e:
             if "quota" not in str(e).lower():
                 return jsonify({"answer": f"OpenAI error: {e}", "sources": []})
@@ -163,7 +144,11 @@ def search_answer():
             model = genai.GenerativeModel("gemini-1.5-flash")
             resp = model.generate_content(conversation_text)
             answer = resp.text
-            return jsonify({"answer": answer, "sources": results})
+
+            cited_nums = set(int(n) for n in re.findall(r"\[(\d+)\]", answer))
+            filtered_sources = [results[i-1] for i in cited_nums if 0 < i <= len(results)]
+
+            return jsonify({"answer": answer, "sources": filtered_sources})
         except Exception as e:
             return jsonify({"answer": f"Gemini error: {e}", "sources": []})
 
@@ -181,6 +166,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
