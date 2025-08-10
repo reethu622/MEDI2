@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from better_profanity import profanity
 from flask_cors import CORS
 import requests
-import google.generativeai as genai
+from google import genai  # your import style
 
 app = Flask(__name__)
 CORS(app)
@@ -13,7 +13,7 @@ profanity.load_censor_words()
 
 # Configure Google Generative AI (Gemini)
 GENAI_API_KEY = os.getenv("GOOGLE_GENAI_API_KEY") or "YOUR_GENAI_API_KEY"
-genai.configure(api_key=GENAI_API_KEY)
+client = genai.Client(api_key=GENAI_API_KEY)  # create client instance
 
 # Google Custom Search API setup
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or "YOUR_GOOGLE_API_KEY"
@@ -40,14 +40,11 @@ def google_search(query, num_results=3):
 def generate_gemini_response(prompt):
     """Use Google Gemini (Generative AI) to generate a response."""
     try:
-        model = genai.get_model("gemini-2.5-turbo")  # adjust model name as needed
-        response = model.generate_content(
-            model="gemini-2.5-turbo",
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
             contents=prompt,
-            temperature=0.7,
-            max_output_tokens=300,
         )
-        return response.text if hasattr(response, "text") else str(response)
+        return response.text
     except Exception as e:
         print("Gemini API error:", e)
         return "Sorry, I am having trouble generating a response right now."
@@ -97,3 +94,4 @@ def search_answer():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
