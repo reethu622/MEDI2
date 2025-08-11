@@ -16,16 +16,13 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Basic abusive words list
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
 
 def contains_abuse(text):
-    """Check for abusive words."""
     text = text.lower()
     return any(word in text for word in ABUSIVE_WORDS)
 
 def google_search_with_citations(query, num_results=5):
-    """Google Custom Search with link validation."""
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
         return []
 
@@ -61,8 +58,35 @@ def google_search_with_citations(query, num_results=5):
 
     return results
 
+def extract_last_medical_topic(messages):
+    """
+    Simple heuristic: find last medical topic mentioned by user or assistant.
+    Here, look for last user or assistant message containing a medical term.
+    For simplicity, use last user question keywords or last assistant answer summary.
+    """
+    # Naive approach: from last to first, pick last user question longer than 2 words excluding greetings and thanks
+    greetings_and_thanks = {"hi", "hello", "hey", "thanks", "thank you", "thx", "ty"}
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            content = msg["content"].lower()
+            # Skip greetings and thanks
+            if content in greetings_and_thanks or len(content.split()) < 3:
+                continue
+            # Return last user message as topic candidate
+            return content
+    return None
+
+def replace_pronouns_with_topic(question, topic):
+    if not topic:
+        return question
+    pronouns = ["it", "those", "these", "that", "them",
+                "what about that", "and that", "more about it",
+                "about that", "tell me about it"]
+    pattern = re.compile(r"\b(" + "|".join(re.escape(p) for p in pronouns) + r")\b", flags=re.IGNORECASE)
+    replaced = pattern.sub(topic, question)
+    return replaced
+
 def generate_answer(messages, search_results):
-    """Generate answer strictly based on search results only."""
     if not search_results:
         return ("I'm sorry, I couldn't find relevant information on that topic in trusted sources. "
                 "Please consult a healthcare professional for accurate advice.")
@@ -121,7 +145,7 @@ def search_answer():
     greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
     if latest_user_message.lower() in greetings:
         return jsonify({
-            "answer": "Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?",
+            "answer": "Hello! 👋 I'm Medibot, How may I help you today?",
             "sources": []
         })
 
@@ -133,8 +157,14 @@ def search_answer():
             "sources": []
         })
 
-    # Perform Google search
-    results = google_search_with_citations(latest_user_message, num_results=5)
+    # Extract last medical topic from conversation
+    last_topic = extract_last_medical_topic(messages)
+
+    # Replace pronouns in latest question with last topic if relevant
+    search_query = replace_pronouns_with_topic(latest_user_message, last_topic)
+
+    # Run Google search on expanded query
+    results = google_search_with_citations(search_query, num_results=5)
     answer = generate_answer(messages, results)
 
     return jsonify({"answer": answer, "sources": results})
@@ -146,6 +176,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
