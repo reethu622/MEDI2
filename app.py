@@ -2,18 +2,19 @@ import os
 import re
 import requests
 import google.generativeai as genai
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Load API keys from environment variables
+# Load environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY", "")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX", "")
+GOOGLE_SEARCH_CX_RESTRICTED = os.getenv("GOOGLE_SEARCH_CX_RESTRICTED", "")
+GOOGLE_SEARCH_CX_BROAD = os.getenv("GOOGLE_SEARCH_CX_BROAD", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-app = Flask(__name__, static_folder="static")
+app = Flask(__name__)
 CORS(app)
 
 ABUSIVE_WORDS = ["idiot", "stupid", "dumb", "hate", "shut up", "fool", "damn", "bastard", "crap"]
@@ -22,177 +23,154 @@ def contains_abuse(text):
     text = text.lower()
     return any(word in text for word in ABUSIVE_WORDS)
 
-def google_search_with_citations(query, num_results=5):
-    if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
+def google_search(query, cx_key, num_results=5):
+    if not GOOGLE_SEARCH_KEY or not cx_key:
         return []
 
     params = {
         "key": GOOGLE_SEARCH_KEY,
-        "cx": GOOGLE_SEARCH_CX,
+        "cx": cx_key,
         "q": query,
-        "num": num_results
+        "num": num_results,
     }
     try:
         r = requests.get("https://www.googleapis.com/customsearch/v1", params=params)
         r.raise_for_status()
         data = r.json()
+        results = []
+        for item in data.get("items", []):
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "link": item.get("link", "")
+            })
+        return results
     except Exception as e:
-        print(f"Google Search API error: {e}")
+        print(f"Google search error: {e}")
         return []
 
-    results = []
-    for item in data.get("items", []):
-        link = item.get("link", "")
-        try:
-            head_req = requests.head(link, timeout=3)
-            if head_req.status_code >= 400:
-                continue
-        except:
-            continue
-
-        results.append({
-            "title": item.get("title", ""),
-            "snippet": item.get("snippet", ""),
-            "link": link
-        })
-
-    return results
-
-def extract_last_medical_topic(messages):
-    """
-    Simple heuristic: find last medical topic mentioned by user or assistant.
-    Here, look for last user or assistant message containing a medical term.
-    For simplicity, use last user question keywords or last assistant answer summary.
-    """
-    # Naive approach: from last to first, pick last user question longer than 2 words excluding greetings and thanks
-    greetings_and_thanks = {"hi", "hello", "hey", "thanks", "thank you", "thx", "ty"}
-    for msg in reversed(messages):
-        if msg["role"] == "user":
-            content = msg["content"].lower()
-            # Skip greetings and thanks
-            if content in greetings_and_thanks or len(content.split()) < 3:
-                continue
-            # Return last user message as topic candidate
-            return content
+def extract_main_topic(text):
+    """Extract main medical term or keyword from user query to handle 'types of it' kind of queries"""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    stopwords = {"what", "is", "the", "of", "in", "and", "about", "tell", "me", "a", "an", "are", "types", "type"}
+    words = [w for w in text.split() if w not in stopwords]
+    if words:
+        return words[-1]
     return None
 
-def replace_pronouns_with_topic(question, topic):
-    if not topic:
-        return question
-    pronouns = ["it", "those", "these", "that", "them",
-                "what about that", "and that", "more about it",
-                "about that", "tell me about it"]
-    pattern = re.compile(r"\b(" + "|".join(re.escape(p) for p in pronouns) + r")\b", flags=re.IGNORECASE)
-    replaced = pattern.sub(topic, question)
-    return replaced
+last_topic = None
 
-def generate_answer(messages, search_results):
-    if not search_results:
-        return ("I'm sorry, I couldn't find relevant information on that topic in trusted sources. "
-                "Please consult a healthcare professional for accurate advice.")
+def generate_answer_with_gemini(messages, results):
+    if not GEMINI_API_KEY:
+        # If no Gemini, fallback to simple snippet concat answer
+        if not results:
+            return "I couldn't find relevant information in the sources. Please consult a healthcare professional."
+        snippets = []
+        for idx, item in enumerate(results, start=1):
+            snippets.append(f"{item['snippet']} [{idx}]")
+        return " ".join(snippets)
 
-    sources_text = ""
-    for idx, res in enumerate(search_results, start=1):
-        sources_text += f"[{idx}] {res['title']}\n{res['snippet']}\nLink: {res['link']}\n\n"
+    # Format sources for Gemini prompt
+    formatted_sources = ""
+    for idx, item in enumerate(results, start=1):
+        formatted_sources += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
 
     system_prompt = (
-        "You are Medibot, a medical assistant chatbot. Use ONLY the provided sources to answer the user's question clearly and briefly. "
-        "Cite sources like [1], [2], etc. "
-        "If the sources do not contain relevant information, politely say you cannot find info and recommend consulting a healthcare professional. "
-        "Do NOT use your own general knowledge or add information not in the sources.\n\n"
-        f"Sources:\n{sources_text}\n"
+        "You are a helpful and knowledgeable medical assistant chatbot. "
+        "Answer the user's questions using ONLY the following search results as your sources. "
+        "If the answer is unclear or incomplete, say you do not know and advise consulting a healthcare professional. "
+        "Cite your sources in brackets like [1], [2], etc.\n\n"
+        f"{formatted_sources}"
     )
 
-    try:
-        convo_text = system_prompt + "Conversation:\n"
-        for msg in messages:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            convo_text += f"{role}: {msg['content']}\n"
-        convo_text += "Assistant:"
+    conversation_text = system_prompt + "\nConversation:\n"
+    for msg in messages:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        conversation_text += f"{role}: {msg['content']}\n"
+    conversation_text += "Assistant:"
 
+    try:
         model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_content(convo_text)
-        return resp.text.strip()
+        response = model.generate_content(conversation_text)
+        return response.text.strip()
     except Exception as e:
-        return f"Error generating answer: {e}"
+        print(f"Gemini error: {e}")
+        # Fallback simple answer if Gemini fails
+        if not results:
+            return "I couldn't find relevant information and had an internal error. Please consult a healthcare professional."
+        snippets = []
+        for idx, item in enumerate(results, start=1):
+            snippets.append(f"{item['snippet']} [{idx}]")
+        return " ".join(snippets)
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
+    global last_topic
+
     data = request.get_json()
-    messages = data.get("messages")
+    messages = data.get("messages", [])
+
     if not messages or not isinstance(messages, list):
-        return jsonify({"answer": "Please provide conversation history as a list of messages.", "sources": []})
+        return jsonify({"answer": "Please send conversation messages in the correct format.", "sources": []})
 
-    latest_user_message = next((msg.get("content", "").strip() for msg in reversed(messages) if msg.get("role") == "user"), None)
-    if not latest_user_message:
-        return jsonify({"answer": "No user message found in conversation.", "sources": []})
+    # Get latest user message content
+    latest_user_msg = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            latest_user_msg = msg.get("content", "").strip()
+            break
 
-    # Greet if first interaction
-    if len(messages) == 1 and messages[0]["role"] == "user":
+    if not latest_user_msg:
+        return jsonify({"answer": "No user message found.", "sources": []})
+
+    # Handle abusive words
+    if contains_abuse(latest_user_msg):
+        return jsonify({"answer": "Please keep the conversation respectful.", "sources": []})
+
+    # Greetings
+    if latest_user_msg.lower() in ["hi", "hello", "hey"]:
         return jsonify({
             "answer": "Hello! 👋 I'm Medibot, your Medi Assistant. How may I help you today?",
             "sources": []
         })
 
-    # Abusive filter
-    if contains_abuse(latest_user_message):
+    # Thanks
+    if latest_user_msg.lower() in ["thanks", "thank you", "thx", "ty"]:
         return jsonify({
-            "answer": "I am here to help with medical questions. Please keep the conversation respectful.",
+            "answer": "You're welcome! 😊 Happy to help.",
             "sources": []
         })
 
-    # Greetings
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if latest_user_message.lower() in greetings:
-        return jsonify({
-            "answer": "Hello! 👋 I'm Medibot, How may I help you today?",
-            "sources": []
-        })
+    # Detect if user is asking about vague "types of it" or similar
+    vague_type_phrases = ["types of it", "type of it", "what are the types", "types of that", "types"]
+    is_vague_type_query = any(phrase in latest_user_msg.lower() for phrase in vague_type_phrases)
 
-    # Thanks handling
-    thanks_keywords = ["thanks", "thank you", "thx", "ty"]
-    if any(latest_user_message.lower() == t for t in thanks_keywords):
-        return jsonify({
-            "answer": "You're welcome! 😊 Always happy to help with your medical questions.",
-            "sources": []
-        })
+    if is_vague_type_query and last_topic:
+        search_query = f"types of {last_topic}"
+    else:
+        search_query = latest_user_msg
+        main_topic = extract_main_topic(latest_user_msg)
+        if main_topic:
+            last_topic = main_topic
 
-    # Extract last medical topic from conversation
-    last_topic = extract_last_medical_topic(messages)
+    # Try restricted Google search first
+    results = google_search(search_query, GOOGLE_SEARCH_CX_RESTRICTED, num_results=5)
 
-    # Replace pronouns in latest question with last topic if relevant
-    search_query = replace_pronouns_with_topic(latest_user_message, last_topic)
+    # If no results, fallback to broad search
+    if not results:
+        results = google_search(search_query, GOOGLE_SEARCH_CX_BROAD, num_results=5)
 
-    # Run Google search on expanded query
-    results = google_search_with_citations(search_query, num_results=5)
-    answer = generate_answer(messages, results)
+    answer = generate_answer_with_gemini(messages, results)
 
-    return jsonify({"answer": answer, "sources": results})
+    # Prepare clickable sources for frontend
+    sources = []
+    for idx, item in enumerate(results, start=1):
+        # Simple HTML links — your frontend should render these safely!
+        sources.append(f"[{idx}] <a href='{item['link']}' target='_blank' rel='noopener noreferrer'>{item['title']}</a>")
 
-@app.route("/")
-def serve_index():
-    return send_from_directory(app.static_folder, "medibot.html")
+    return jsonify({"answer": answer, "sources": sources})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
