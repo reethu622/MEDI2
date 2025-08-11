@@ -30,8 +30,16 @@ def contains_abuse(text):
             return True
     return False
 
+def verify_link(url):
+    """Check if a link is valid (returns HTTP 200)."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=5)
+        return r.status_code == 200
+    except:
+        return False
+
 def google_search_with_citations(query, num_results=5):
-    """Perform Google Custom Search and return results with formatted citations."""
+    """Perform Google Custom Search and return verified results with formatted citations."""
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
         return [], ""  # Skip search if keys missing
 
@@ -54,7 +62,10 @@ def google_search_with_citations(query, num_results=5):
         title = item.get("title", "")
         snippet = item.get("snippet", "")
         link = item.get("link", "")
-        results.append({"title": title, "snippet": snippet, "link": link})
+
+        if verify_link(link):  # ✅ Only include working links
+            results.append({"title": title, "snippet": snippet, "link": link})
+
     return results, ""
 
 def is_answer_incomplete(answer_text, user_query):
@@ -128,30 +139,50 @@ def generate_answer_with_sources(messages, results):
 
 def get_last_medical_topic(messages):
     """
-    Simple heuristic: scan messages backward for last mention of a medical topic.
-    Expand the list as needed.
+    Dynamically detect last medical topic without a hardcoded list.
+    Uses OpenAI or Gemini if available; otherwise falls back to basic heuristics.
     """
-    medical_terms = [
-        "diabetes", "asthma", "cancer", "migraine", "hypertension",
-        "glaucoma", "stroke", "arthritis", "depression", "anxiety",
-        "covid", "influenza", "pneumonia", "eczema", "eczema",
-        "alzheimer", "parkinson"
-    ]
+    conversation_text = "\n".join(
+        f"{msg['role'].capitalize()}: {msg['content']}" for msg in reversed(messages)
+    )
 
+    topic_prompt = (
+        "From the following conversation, identify the most recent specific medical condition "
+        "or health-related topic mentioned. Respond with only the name of the condition, nothing else.\n\n"
+        f"{conversation_text}"
+    )
+
+    try:
+        if OPENAI_API_KEY:
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "system", "content": topic_prompt}],
+                temperature=0,
+            )
+            topic = resp.choices[0].message["content"].strip()
+            return topic if topic.lower() != "none" else None
+
+        elif GEMINI_API_KEY:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_content(topic_prompt)
+            topic = resp.text.strip()
+            return topic if topic.lower() != "none" else None
+
+    except Exception as e:
+        print(f"Topic extraction error: {e}")
+
+    # Fallback: take last significant word from last relevant message
+    import re
     for msg in reversed(messages):
-        text = msg.get("content", "").lower()
-        for term in medical_terms:
-            if term in text:
-                return term
+        words = re.findall(r"\b[A-Za-z]{4,}\b", msg.get("content", ""))
+        if words:
+            return words[-1]
     return None
 
 def rewrite_query(query, last_topic):
-    """
-    Replace ambiguous pronouns with last_topic if found.
-    """
+    """Replace ambiguous pronouns with last_topic if found."""
     if not last_topic:
         return query
-
     pronouns = ["it", "those", "these", "that", "them"]
     pattern = re.compile(r"\b(" + "|".join(pronouns) + r")\b", flags=re.IGNORECASE)
     new_query = pattern.sub(last_topic, query)
@@ -207,6 +238,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
