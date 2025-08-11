@@ -27,7 +27,7 @@ def contains_abuse(text):
 def google_search_with_citations(query, num_results=5):
     """Google Custom Search with working link verification."""
     if not GOOGLE_SEARCH_KEY or not GOOGLE_SEARCH_CX:
-        return [], ""
+        return []
 
     params = {
         "key": GOOGLE_SEARCH_KEY,
@@ -41,7 +41,7 @@ def google_search_with_citations(query, num_results=5):
         data = r.json()
     except Exception as e:
         print(f"Google Search API error: {e}")
-        return [], ""
+        return []
 
     results = []
     for item in data.get("items", []):
@@ -59,20 +59,7 @@ def google_search_with_citations(query, num_results=5):
             "link": link
         })
 
-    return results, ""
-
-def is_answer_incomplete(answer_text, user_query):
-    """Detect incomplete answers."""
-    answer_lower = answer_text.lower()
-    if any(phrase in answer_lower for phrase in ["sorry", "don't know", "cannot find", "need more information"]):
-        return True
-
-    question_keywords = ["type", "types", "explain", "list", "what are", "different kinds", "kinds"]
-    if any(word in user_query.lower() for word in question_keywords):
-        if "type" not in answer_lower and "kind" not in answer_lower and "explain" not in answer_lower:
-            return True
-
-    return False
+    return results
 
 def extract_last_medical_topic_with_gemini(messages):
     """Ask Gemini to find the last medical topic from conversation."""
@@ -106,18 +93,28 @@ def rewrite_query(query, last_topic, pronouns=None):
     return pattern.sub(last_topic, query)
 
 def generate_answer_with_sources(messages, results):
-    """Generate an answer using Gemini."""
-    formatted_results_text = ""
+    """Generate an answer using Gemini, keep it concise for simple questions."""
+    # Get last user message
+    last_user_msg = ""
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            last_user_msg = msg["content"].strip().lower()
+            break
+
+    # Detect simple "what is X" questions (no 'types', 'symptoms' etc)
+    simple_what_is = last_user_msg.startswith("what is ") and \
+                     all(word not in last_user_msg for word in ["types", "symptoms", "causes", "treatment", "prevention"])
+
+    # Prepare sources text for prompt, only titles and links (for citation)
+    sources_text = ""
     for idx, item in enumerate(results, start=1):
-        formatted_results_text += f"[{idx}] {item['title']}\n{item['snippet']}\nSource: {item['link']}\n\n"
+        sources_text += f"[{idx}] {item['title']}\n{item['link']}\n"
 
     system_prompt = (
-        "You are a helpful and knowledgeable medical assistant chatbot. "
-        "When the user uses vague pronouns, infer they mean the most recent medical topic from the conversation. "
-        "Always answer based on these search results. "
-        "If unsure, politely say you don't know and recommend consulting a healthcare professional. "
-        "Cite sources with [1], [2], etc.\n\n"
-        f"{formatted_results_text}\n"
+        "You are Medibot, a concise medical assistant. "
+        "Answer briefly and clearly.\n"
+        "Use the following sources to help answer, and cite them as [1], [2], etc.\n\n"
+        f"{sources_text}\n"
     )
 
     try:
@@ -126,9 +123,22 @@ def generate_answer_with_sources(messages, results):
             role = "User" if msg["role"] == "user" else "Assistant"
             conversation_text += f"{role}: {msg['content']}\n"
         conversation_text += "Assistant:"
+
         model = genai.GenerativeModel("gemini-1.5-flash")
-        resp = model.generate_content(conversation_text)
-        return resp.text
+
+        prompt = conversation_text
+        if simple_what_is:
+            prompt += "\nPlease provide a brief, direct definition only.\n"
+
+        resp = model.generate_content(prompt)
+        answer = resp.text.strip()
+
+        # Truncate answer for simple questions (max 2 sentences)
+        if simple_what_is:
+            sentences = re.split(r'(?<=[.!?]) +', answer)
+            answer = " ".join(sentences[:2])
+
+        return answer
     except Exception as e:
         return f"Gemini error: {e}"
 
@@ -173,19 +183,15 @@ def search_answer():
             "sources": []
         })
 
-    # Last topic detection
+    # Extract last topic and rewrite query for pronouns
     last_topic = extract_last_medical_topic_with_gemini(messages)
     search_query = rewrite_query(latest_user_message, last_topic)
 
-    # Google search
-    results, _ = google_search_with_citations(search_query, num_results=5)
-    answer = generate_answer_with_sources(messages, results)
+    # Perform Google search
+    results = google_search_with_citations(search_query, num_results=5)
 
-    # If incomplete, broader search
-    if is_answer_incomplete(answer, latest_user_message):
-        fallback_results, _ = google_search_with_citations(search_query, num_results=15)
-        answer = generate_answer_with_sources(messages, fallback_results)
-        return jsonify({"answer": answer, "sources": fallback_results})
+    # Generate answer
+    answer = generate_answer_with_sources(messages, results)
 
     return jsonify({"answer": answer, "sources": results})
 
@@ -196,6 +202,7 @@ def serve_index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
