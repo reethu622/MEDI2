@@ -93,27 +93,16 @@ def rewrite_query(query, last_topic, pronouns=None):
     return pattern.sub(last_topic, query)
 
 def generate_answer_with_sources(messages, results):
-    """Generate an answer using Gemini, keep it concise for simple questions."""
-    # Get last user message
-    last_user_msg = ""
-    for msg in reversed(messages):
-        if msg["role"] == "user":
-            last_user_msg = msg["content"].strip().lower()
-            break
-
-    # Detect simple "what is X" questions (no 'types', 'symptoms' etc)
-    simple_what_is = last_user_msg.startswith("what is ") and \
-                     all(word not in last_user_msg for word in ["types", "symptoms", "causes", "treatment", "prevention"])
-
     # Prepare sources text for prompt, only titles and links (for citation)
     sources_text = ""
     for idx, item in enumerate(results, start=1):
-        sources_text += f"[{idx}] {item['title']}\n{item['link']}\n"
+        sources_text += f"[{idx}] Title: {item['title']}\nLink: {item['link']}\n"
 
     system_prompt = (
-        "You are Medibot, a concise medical assistant. "
-        "Answer briefly and clearly.\n"
-        "Use the following sources to help answer, and cite them as [1], [2], etc.\n\n"
+        "You are Medibot, a knowledgeable medical assistant. "
+        "Answer ONLY based on the provided sources below. Cite sources as [1], [2], etc., "
+        "matching the order of the sources. "
+        "If the answer is not found in these sources, politely say you don't know or recommend consulting a healthcare professional.\n\n"
         f"{sources_text}\n"
     )
 
@@ -125,22 +114,15 @@ def generate_answer_with_sources(messages, results):
         conversation_text += "Assistant:"
 
         model = genai.GenerativeModel("gemini-1.5-flash")
-
-        prompt = conversation_text
-        if simple_what_is:
-            prompt += "\nPlease provide a brief, direct definition only.\n"
-
-        resp = model.generate_content(prompt)
+        resp = model.generate_content(conversation_text)
         answer = resp.text.strip()
 
-        # Truncate answer for simple questions (max 2 sentences)
-        if simple_what_is:
-            sentences = re.split(r'(?<=[.!?]) +', answer)
-            answer = " ".join(sentences[:2])
+        # Optionally truncate or keep full answer
 
         return answer
     except Exception as e:
         return f"Gemini error: {e}"
+
 
 @app.route("/api/v1/search_answer", methods=["POST"])
 def search_answer():
