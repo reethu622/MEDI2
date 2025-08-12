@@ -150,7 +150,7 @@ def generate_answer_with_sources(messages, results, last_topic=None):
                 role = "User" if msg["role"] == "user" else "Assistant"
                 conversation_text += f"{role}: {msg['content']}\n"
             conversation_text += "Assistant:"
-            model = genai.GenerativeModel("gemini-2.0-flash")
+            model = genai.GenerativeModel("gemini-1.5-flash")
             resp = model.generate_content(conversation_text)
             return resp.text
         except Exception as e:
