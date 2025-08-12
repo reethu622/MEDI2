@@ -103,6 +103,20 @@ def extract_types_from_snippets(results, topic=None):
                 types_texts.append(types_str)
     return "\n".join(types_texts)
 
+def clean_answer_placeholders(answer_text):
+    """
+    Remove any placeholder citation texts like:
+    *(This would be a citation to a reputable source...)*
+    Also remove multiple spaces or newlines caused by removals.
+    """
+    # Remove text in parentheses starting with * and containing 'citation'
+    cleaned = re.sub(r"\*\([^)]*citation[^)]*\)\*", "", answer_text, flags=re.IGNORECASE)
+    
+    # Remove extra whitespace/newlines after removal
+    cleaned = re.sub(r"\n\s*\n", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned
+
 def generate_answer_with_sources(messages, results, last_topic=None):
     """Generate an answer using OpenAI or Gemini based on search results and conversation."""
 
@@ -116,9 +130,11 @@ def generate_answer_with_sources(messages, results, last_topic=None):
         "When the user uses pronouns like 'it', 'those', 'these', or says 'explain that', "
         "infer that they mean the most recent medical topic or condition discussed earlier in the conversation. "
         "Always keep track of conversational context carefully. "
-        "Answer the user's questions based on the following web search results. "
-        "If you cannot find a clear answer, politely say you don't know and recommend consulting a healthcare professional. "
-        "Cite your sources with numbers like [1], [2], etc.\n\n"
+        "Answer the user's questions using ONLY the information in the following web search results. "
+        "Cite your sources clearly and explicitly by referencing the corresponding source numbers like [1], [2], etc. "
+        "Do NOT invent or hallucinate citations. "
+        "Do NOT use any placeholder text such as '(This would be a citation...)'. "
+        "If the answer cannot be found in these sources, say politely that you do not know and recommend consulting a healthcare professional.\n\n"
     )
     if extracted_types:
         system_prompt += f"Here are some types or categories extracted from the search results:\n{extracted_types}\n\n"
@@ -215,34 +231,39 @@ def search_answer():
         return jsonify({"answer": "Hi! How may I help you with your medical questions today?", "sources": []})
 
     last_topic = get_last_medical_topic(messages)
-    search_query = rewrite_query(latest_user_message, last_topic)
+    user_query = rewrite_query(latest_user_message, last_topic)
 
-    results, _ = google_search_with_citations(search_query, num_results=5, broad=False)
-    extracted_types = extract_types_from_snippets(results, topic=last_topic)
+    # First search with restricted (specific) CX
+    results, error = google_search_with_citations(user_query, broad=False)
+    if error:
+        return jsonify({"answer": f"Search error: {error}", "sources": []})
+
     answer = generate_answer_with_sources(messages, results, last_topic=last_topic)
+    answer = clean_answer_placeholders(answer)
 
-    # If the user asks about "types" but no types info found, do fallback search forcing "types of <topic>"
-    if "type" in latest_user_message.lower() and not extracted_types:
-        fallback_query = f"types of {last_topic}" if last_topic else latest_user_message
-        fallback_results, _ = google_search_with_citations(fallback_query, num_results=10, broad=False)
-        answer = generate_answer_with_sources(messages, fallback_results, last_topic=last_topic)
-        return jsonify({"answer": answer, "sources": fallback_results})
-
-    # If answer is incomplete, fallback to broader search
-    if is_answer_incomplete(answer, latest_user_message):
-        fallback_results, _ = google_search_with_citations(search_query, num_results=15, broad=True)
-        answer = generate_answer_with_sources(messages, fallback_results, last_topic=last_topic)
-        return jsonify({"answer": answer, "sources": fallback_results})
+    # Check if answer seems incomplete and fallback to broad search if needed
+    if is_answer_incomplete(answer, user_query):
+        broad_results, broad_error = google_search_with_citations(user_query, broad=True)
+        if broad_results:
+            broad_answer = generate_answer_with_sources(messages, broad_results, last_topic=last_topic)
+            broad_answer = clean_answer_placeholders(broad_answer)
+            if len(broad_answer) > len(answer):
+                answer = broad_answer
+                results = broad_results
 
     return jsonify({"answer": answer, "sources": results})
 
-@app.route("/")
-def serve_index():
-    return send_from_directory(app.static_folder, "medibot.html")
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_static(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, "index.html")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
+
 
 
 
